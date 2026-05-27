@@ -138,4 +138,136 @@ describe('Property 54 — Subscription Tier Deployment Limits', () => {
       expect(checkDeploymentLimit('enterprise', count).allowed).toBe(true);
     }
   });
+
+  // ── Exhaustive permutation tests ──────────────────────────────────────────
+
+  describe('Exhaustive tier × feature × limit permutations', () => {
+    const permutations: Array<{
+      tier: SubscriptionTier;
+      feature: string;
+      testCases: Array<{ existing: number; shouldAllow: boolean }>;
+    }> = [];
+
+    // Build permutation matrix
+    for (const tier of TIERS) {
+      const { maxDeployments, maxCustomDomains, analytics } = TIER_CONFIGS[tier].entitlements;
+
+      permutations.push({
+        tier,
+        feature: 'deployments',
+        testCases: [
+          { existing: 0, shouldAllow: true },
+          { existing: Math.max(0, maxDeployments - 1), shouldAllow: maxDeployments === -1 || maxDeployments > 1 },
+          { existing: maxDeployments, shouldAllow: maxDeployments === -1 },
+          { existing: maxDeployments + 1, shouldAllow: maxDeployments === -1 },
+        ],
+      });
+
+      permutations.push({
+        tier,
+        feature: 'customDomains',
+        testCases: [
+          { existing: 0, shouldAllow: true },
+          { existing: maxCustomDomains, shouldAllow: maxCustomDomains === -1 },
+          { existing: maxCustomDomains + 1, shouldAllow: maxCustomDomains === -1 },
+        ],
+      });
+
+      permutations.push({
+        tier,
+        feature: 'analytics',
+        testCases: [
+          { existing: 0, shouldAllow: analytics },
+          { existing: 1, shouldAllow: analytics },
+        ],
+      });
+    }
+
+    // Execute all permutations
+    for (const perm of permutations) {
+      for (const testCase of perm.testCases) {
+        it(`${perm.tier} tier: ${perm.feature} with ${testCase.existing} existing → ${testCase.shouldAllow ? 'allowed' : 'rejected'}`, () => {
+          const result = checkDeploymentLimit(perm.tier, testCase.existing);
+          expect(result.allowed).toBe(testCase.shouldAllow);
+        });
+      }
+    }
+  });
+
+  // ── Upgrade/downgrade transition tests ────────────────────────────────────
+
+  describe('Tier upgrade and downgrade transitions', () => {
+    it('upgrade from free to pro: existing deployment remains accessible', () => {
+      const freeResult = checkDeploymentLimit('free', 1);
+      expect(freeResult.allowed).toBe(false);
+
+      const proResult = checkDeploymentLimit('pro', 1);
+      expect(proResult.allowed).toBe(true);
+    });
+
+    it('upgrade from pro to enterprise: unlimited deployments', () => {
+      const proLimit = TIER_CONFIGS.pro.entitlements.maxDeployments;
+      const proResult = checkDeploymentLimit('pro', proLimit);
+      expect(proResult.allowed).toBe(false);
+
+      const enterpriseResult = checkDeploymentLimit('enterprise', proLimit);
+      expect(enterpriseResult.allowed).toBe(true);
+    });
+
+    it('downgrade from pro to free: existing deployments exceed new limit', () => {
+      const proLimit = TIER_CONFIGS.pro.entitlements.maxDeployments;
+      const freeLimit = TIER_CONFIGS.free.entitlements.maxDeployments;
+
+      const proResult = checkDeploymentLimit('pro', proLimit - 1);
+      expect(proResult.allowed).toBe(true);
+
+      const freeResult = checkDeploymentLimit('free', proLimit - 1);
+      expect(freeResult.allowed).toBe(false);
+    });
+
+    it('downgrade from enterprise to pro: respects new limit', () => {
+      const proLimit = TIER_CONFIGS.pro.entitlements.maxDeployments;
+      const enterpriseResult = checkDeploymentLimit('enterprise', proLimit + 5);
+      expect(enterpriseResult.allowed).toBe(true);
+
+      const proResult = checkDeploymentLimit('pro', proLimit + 5);
+      expect(proResult.allowed).toBe(false);
+    });
+  });
+
+  // ── Boundary condition tests ──────────────────────────────────────────────
+
+  describe('Boundary conditions', () => {
+    it('all tiers: 0 existing deployments always allowed', () => {
+      for (const tier of TIERS) {
+        expect(checkDeploymentLimit(tier, 0).allowed).toBe(true);
+      }
+    });
+
+    it('all tiers: exactly at limit boundary', () => {
+      for (const tier of TIERS) {
+        const limit = TIER_CONFIGS[tier].entitlements.maxDeployments;
+        const result = checkDeploymentLimit(tier, limit);
+        expect(result.allowed).toBe(limit === -1);
+      }
+    });
+
+    it('all tiers: one below limit boundary', () => {
+      for (const tier of TIERS) {
+        const limit = TIER_CONFIGS[tier].entitlements.maxDeployments;
+        if (limit > 0) {
+          const result = checkDeploymentLimit(tier, limit - 1);
+          expect(result.allowed).toBe(true);
+        }
+      }
+    });
+
+    it('all tiers: far exceeding limit', () => {
+      for (const tier of TIERS) {
+        const limit = TIER_CONFIGS[tier].entitlements.maxDeployments;
+        const result = checkDeploymentLimit(tier, limit === -1 ? 1000 : limit + 100);
+        expect(result.allowed).toBe(limit === -1);
+      }
+    });
+  });
 });
