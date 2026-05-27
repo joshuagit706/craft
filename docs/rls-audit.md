@@ -2,6 +2,35 @@
 
 > Issue #235 · Audited 2026-03-29
 
+## Test Coverage Matrix
+
+Property-based tests verify RLS isolation across all tables and operations. Coverage includes:
+
+| Table | SELECT | INSERT | UPDATE | DELETE | Cross-Tenant | Edge Cases | Performance |
+|-------|--------|--------|--------|--------|--------------|------------|-------------|
+| `profiles` | ✅ | ✅ | ✅ | N/A | ✅ | ✅ | ✅ |
+| `deployments` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `deployment_logs` | ✅ | ✅ | N/A | N/A | ✅ | ✅ | ✅ |
+| `deployment_analytics` | ✅ | ✅ | N/A | N/A | ✅ | ✅ | ✅ |
+| `customization_drafts` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `templates` | ✅ | N/A | N/A | N/A | N/A | ✅ | ✅ |
+
+**Test file**: `supabase/tests/rls/policy-verification.test.ts`
+
+**Test categories**:
+1. **Service-role bypass** — Verifies service_role skips all policies
+2. **Cross-table isolation** — Ensures users cannot access other users' data via indirect joins
+3. **Edge cases** — NULL uid, empty deployment sets, profile id mismatches
+4. **Policy conflicts** — UPDATE USING vs WITH CHECK predicates
+5. **Performance** — Indirect-join policies scale linearly with owned deployments, not total table size
+
+**Key assertions**:
+- User A cannot read User B's deployments, logs, or analytics
+- User A cannot update User B's profiles or drafts
+- Service role bypasses all policies unconditionally
+- Anon role is denied all access to user-scoped tables
+- Indirect-join policies correctly filter by owned deployment set
+
 ## Summary Table
 
 | Table                  | RLS Enabled | Policies (ops)                                      | Findings                                                                                  |
