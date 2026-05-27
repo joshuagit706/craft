@@ -3,14 +3,18 @@
   "mutate": [
     "apps/backend/src/services/auth.service.ts",
     "apps/backend/src/services/payment.service.ts",
-    "apps/backend/src/services/deployment-pipeline.service.ts"
+    "apps/backend/src/services/deployment-pipeline.service.ts",
+    "apps/backend/src/services/deployment-queue.service.ts",
+    "apps/backend/src/services/deployment-monitor.service.ts",
+    "apps/backend/src/services/deployment-rollback.service.ts"
   ],
   "testRunner": "vitest",
   "testPathPattern": [
     "apps/backend/src/services/auth.service.test.ts",
     "apps/backend/src/services/auth.integration.test.ts",
     "apps/backend/src/services/payment.service.test.ts",
-    "apps/backend/src/services/deployment-pipeline.service.test.ts"
+    "apps/backend/src/services/deployment-pipeline.service.test.ts",
+    "apps/backend/tests/deployment/**/*.test.ts"
   ],
   "reporters": [
     "progress-append-only",
@@ -28,6 +32,45 @@
     "high": 80,
     "medium": 70,
     "low": 60
+  },
+  "perFile": {
+    "thresholds": {
+      "high": 75,
+      "medium": 65,
+      "low": 55
+    },
+    "files": {
+      "apps/backend/src/services/deployment-pipeline.service.ts": {
+        "high": 75,
+        "medium": 65,
+        "low": 55
+      },
+      "apps/backend/src/services/deployment-queue.service.ts": {
+        "high": 75,
+        "medium": 65,
+        "low": 55
+      },
+      "apps/backend/src/services/deployment-monitor.service.ts": {
+        "high": 75,
+        "medium": 65,
+        "low": 55
+      },
+      "apps/backend/src/services/deployment-rollback.service.ts": {
+        "high": 75,
+        "medium": 65,
+        "low": 55
+      },
+      "apps/backend/src/services/auth.service.ts": {
+        "high": 80,
+        "medium": 70,
+        "low": 60
+      },
+      "apps/backend/src/services/payment.service.ts": {
+        "high": 80,
+        "medium": 70,
+        "low": 60
+      }
+    }
   },
   "timeoutMS": 5000,
   "timeoutFactor": 1.25,

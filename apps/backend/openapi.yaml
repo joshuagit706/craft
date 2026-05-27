@@ -455,3 +455,74 @@ components:
       type: http
       scheme: bearer
       bearerFormat: JWT
+
+# ── Webhook Security Requirements ──────────────────────────────────────────────
+
+webhookSecurity:
+  description: |
+    All webhook endpoints require HMAC-SHA256 signature verification to ensure
+    authenticity and prevent unauthorized access.
+
+  signatureVerification:
+    algorithm: HMAC-SHA256
+    headerName: x-hub-signature-256
+    format: "sha256=<hex>"
+    example: "sha256=abcd1234efgh5678ijkl9012mnop3456qrst7890uvwx1234yzab5678cdef"
+
+  requiredHeaders:
+    - name: x-hub-signature-256
+      description: HMAC-SHA256 signature of the request body
+      required: true
+      example: "sha256=abcd1234..."
+
+    - name: x-github-delivery
+      description: Unique delivery ID for replay attack prevention
+      required: true
+      format: UUID
+      example: "12345678-1234-1234-1234-123456789012"
+
+    - name: x-github-hook-installation-target-id
+      description: Timestamp of webhook generation
+      required: true
+      format: Unix timestamp (milliseconds)
+      example: "1716806054573"
+
+  securityRequirements:
+    - name: Signature Verification
+      description: |
+        All webhook payloads must be verified using HMAC-SHA256 with the
+        configured webhook secret. Requests with invalid signatures must
+        return HTTP 401 Unauthorized.
+
+    - name: Replay Attack Prevention
+      description: |
+        Delivery IDs must be tracked and checked for duplicates. Replayed
+        webhooks (same delivery ID) must be rejected with HTTP 401.
+        Cache delivery IDs for 24 hours.
+
+    - name: Timestamp Validation
+      description: |
+        Webhook timestamps must be within ±5 minutes of server time.
+        Requests outside this window should be rejected with HTTP 401.
+
+    - name: Error Handling
+      description: |
+        All security violations must return HTTP 401 Unauthorized, never 500.
+        Error messages should not leak implementation details.
+
+  testingGuidelines:
+    - |
+      Generate valid signatures using:
+      HMAC-SHA256(payload, secret) → hex → prepend "sha256="
+
+    - |
+      Test replay prevention by sending the same delivery ID twice
+
+    - |
+      Test timestamp validation by sending requests with old timestamps
+
+    - |
+      Verify that invalid signatures always return 401, not 500
+
+    - |
+      Ensure error messages don't reveal the webhook secret or algorithm details
