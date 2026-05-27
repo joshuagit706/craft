@@ -1,6 +1,37 @@
 import { createClient } from '@/lib/supabase/server';
 import { analyticsService } from './analytics.service';
 
+/**
+ * HealthMonitorService — dependency graph
+ *
+ * External dependencies checked during health monitoring:
+ *
+ *   ┌─────────────────────────────────────────────────────────┐
+ *   │                  HealthMonitorService                   │
+ *   │                                                         │
+ *   │  checkDeploymentHealth(id)                              │
+ *   │    ├── [DB] Supabase → deployments.deployment_url       │
+ *   │    ├── [NET] fetch(deployment_url) — HEAD request        │
+ *   │    │         (URL may point to Vercel, Stellar, Stripe,  │
+ *   │    │          or any monitored service endpoint)         │
+ *   │    └── [SVC] analyticsService.recordUptimeCheck()       │
+ *   │                                                         │
+ *   │  checkAllDeployments()                                  │
+ *   │    ├── [DB] Supabase → deployments (status+is_active)   │
+ *   │    └── → checkDeploymentHealth() × N                    │
+ *   │                                                         │
+ *   │  monitorDeployment(id)                                  │
+ *   │    ├── → checkDeploymentHealth()                        │
+ *   │    ├── [DB] Supabase → deployments.user_id              │
+ *   │    └── → notifyDowntime()  [console / future webhook]   │
+ *   └─────────────────────────────────────────────────────────┘
+ *
+ * Failure modes:
+ *   - Database unavailable  → isHealthy: false, error set
+ *   - Network timeout       → isHealthy: false, error: timeout message
+ *   - Non-2xx response      → isHealthy: false, statusCode set
+ *   - Analytics write fails → health result still returned (best-effort)
+ */
 export class HealthMonitorService {
     /**
      * Check deployment health
