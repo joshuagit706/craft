@@ -4,8 +4,23 @@
  * Manages Vercel API interactions for project creation and deployment.
  *
  * Configuration (env vars):
- *   VERCEL_TOKEN     — Vercel API token (required)
- *   VERCEL_TEAM_ID   — Optional. When set, all projects are scoped to this team.
+ *   VERCEL_TOKEN                  — Vercel API token (required)
+ *   VERCEL_TEAM_ID                — Optional. When set, all projects are scoped to this team.
+ *
+ * Circuit Breaker Configuration (env vars):
+ *   VERCEL_CB_FAILURE_THRESHOLD   — Consecutive failures before opening the circuit.
+ *                                   Default: 5
+ *   VERCEL_CB_RESET_TIMEOUT_MS    — Milliseconds to wait in OPEN before probing recovery.
+ *                                   Default: 30000 (30 s)
+ *
+ * Circuit Breaker Behaviour:
+ *   CLOSED    — Normal operation. Failures are counted toward the threshold.
+ *   OPEN      — All calls fail-fast with CircuitOpenError. No Vercel API calls are made.
+ *   HALF_OPEN — One probe request is allowed through to test recovery.
+ *               Success → CLOSED; failure → OPEN (cooldown resets).
+ *
+ * State transitions are logged to console with the circuit name and direction,
+ * e.g. vercel: CLOSED → OPEN (failureThreshold=5, resetTimeoutMs=30000).
  *
  * Responsibilities:
  *   - Validate required configuration at construction time via validateConfig()
@@ -23,7 +38,7 @@
  */
 
 import type { VercelEnvVar } from '@/lib/env/env-template-generator';
-import { CircuitBreaker } from '@/lib/api/circuit-breaker';
+import { CircuitBreaker, type CircuitState } from '@/lib/api/circuit-breaker';
 
 export type { VercelEnvVar };
 
@@ -277,7 +292,28 @@ interface FetchLike {
     (input: string, init?: RequestInit): Promise<Response>;
 }
 
-const vercelCircuitBreaker = new CircuitBreaker({ name: 'vercel' });
+function logCircuitStateChange(
+    name: string,
+    from: CircuitState,
+    to: CircuitState,
+    metadata?: Record<string, unknown>,
+): void {
+    const meta = metadata ? ` ${JSON.stringify(metadata)}` : '';
+    console.log(`[circuit-breaker] ${name}: ${from} → ${to}${meta}`);
+}
+
+function createVercelCircuitBreaker(): CircuitBreaker {
+    const failureThreshold = parseInt(process.env.VERCEL_CB_FAILURE_THRESHOLD ?? '5', 10);
+    const resetTimeoutMs   = parseInt(process.env.VERCEL_CB_RESET_TIMEOUT_MS  ?? '30000', 10);
+    return new CircuitBreaker({
+        name: 'vercel',
+        failureThreshold,
+        resetTimeoutMs,
+        onStateChange: logCircuitStateChange,
+    });
+}
+
+const vercelCircuitBreaker = createVercelCircuitBreaker();
 
 export class VercelService {
     constructor(

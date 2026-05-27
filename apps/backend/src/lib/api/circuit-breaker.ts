@@ -31,6 +31,8 @@ export interface CircuitBreakerConfig {
     resetTimeoutMs?: number;
     /** Injected clock — override in tests. Default: Date.now */
     now?: () => number;
+    /** Called whenever the circuit transitions between states. */
+    onStateChange?: (name: string, from: CircuitState, to: CircuitState, metadata?: Record<string, unknown>) => void;
 }
 
 /** Thrown when a call is rejected because the circuit is OPEN. */
@@ -49,6 +51,7 @@ export class CircuitBreaker {
     private readonly failureThreshold: number;
     private readonly resetTimeoutMs: number;
     private readonly now: () => number;
+    private readonly onStateChange?: CircuitBreakerConfig['onStateChange'];
     readonly name: string;
 
     constructor(config: CircuitBreakerConfig) {
@@ -56,6 +59,7 @@ export class CircuitBreaker {
         this.failureThreshold = config.failureThreshold ?? 5;
         this.resetTimeoutMs = config.resetTimeoutMs ?? 30_000;
         this.now = config.now ?? Date.now;
+        this.onStateChange = config.onStateChange;
     }
 
     get currentState(): CircuitState {
@@ -96,24 +100,34 @@ export class CircuitBreaker {
     private transitionIfDue(): void {
         if (this.state === 'OPEN' && this.openedAt !== null) {
             if (this.now() - this.openedAt >= this.resetTimeoutMs) {
-                this.state = 'HALF_OPEN';
+                this.transition('HALF_OPEN', { waitedMs: this.now() - this.openedAt });
             }
         }
     }
 
     private onSuccess(): void {
+        const prev = this.state;
         this.failureCount = 0;
         this.openedAt = null;
         this.state = 'CLOSED';
+        if (prev !== 'CLOSED') this.onStateChange?.(this.name, prev, 'CLOSED');
     }
 
     private onFailure(): void {
         this.failureCount += 1;
 
         if (this.state === 'HALF_OPEN' || this.failureCount >= this.failureThreshold) {
+            const prev = this.state;
             this.state = 'OPEN';
             this.openedAt = this.now();
             this.failureCount = 0;
+            this.onStateChange?.(this.name, prev, 'OPEN', { resetTimeoutMs: this.resetTimeoutMs });
         }
+    }
+
+    private transition(to: CircuitState, metadata?: Record<string, unknown>): void {
+        const from = this.state;
+        this.state = to;
+        this.onStateChange?.(this.name, from, to, metadata);
     }
 }
