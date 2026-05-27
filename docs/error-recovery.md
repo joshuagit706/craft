@@ -475,3 +475,110 @@ Prevention: <follow-up action items>
 | Stripe support | support.stripe.com |
 | Vercel support | vercel.com/support |
 | Security issues | security@craft.app |
+
+---
+
+## Multi-Region Deployment Failover and Recovery
+
+### Overview
+
+CRAFT deployments target multiple Vercel regions simultaneously (`iad1`, `sfo1`, `fra1`, `sin1`, `gru1`). The deployment pipeline tracks per-region status independently so that a single region failure does not block the entire deployment.
+
+### Region Status Model
+
+Each region record carries one of the following statuses:
+
+| Status | Meaning |
+|--------|---------|
+| `pending` | Region deployment has not started |
+| `deploying` | Vercel deployment in progress |
+| `healthy` | Deployment succeeded and health check passed |
+| `failed` | Deployment or health check failed |
+| `rolled_back` | Region was rolled back to the previous version |
+
+The `overallStatus` of a multi-region deployment is derived as:
+
+- `completed` — all regions are `healthy`
+- `partial` — at least one region is `healthy` and at least one is `failed`
+- `failed` — all regions are `failed`
+- `rolled_back` — rollback was triggered and all regions are `rolled_back`
+
+### Failure Scenarios and Recovery Behaviour
+
+#### Scenario 1: Single Region Outage
+
+**Trigger**: One region returns a 5xx or connection error from the Vercel API.
+
+**Behaviour**:
+1. The failed region is marked `failed` with the error message recorded.
+2. All other regions continue to `healthy`.
+3. `overallStatus` is set to `partial`.
+4. The failover procedure re-attempts deployment to the failed region only.
+5. If failover succeeds, `overallStatus` transitions to `completed`.
+
+#### Scenario 2: Primary Region Outage
+
+**Trigger**: The primary region (`iad1`) is unreachable before any region has deployed.
+
+**Behaviour**:
+1. All regions remain `pending` or transition to `failed`.
+2. `overallStatus` is set to `failed`.
+3. No rollback is needed (nothing was deployed).
+4. The operator must resolve the primary region issue and re-trigger the pipeline.
+
+#### Scenario 3: Partial Success
+
+**Trigger**: A subset of regions deploy successfully; the remainder fail (e.g. build timeout, rate limit).
+
+**Behaviour**:
+1. Successful regions are marked `healthy`; failed regions are marked `failed`.
+2. `overallStatus` is `partial`.
+3. Failed regions record the specific error (timeout, 429, etc.).
+4. The failover procedure targets only the failed regions.
+5. If all failover attempts succeed, `overallStatus` becomes `completed`.
+6. If failover also fails, the operator may trigger a full rollback.
+
+#### Scenario 4: All Regions Failed
+
+**Trigger**: Every region returns an error (e.g. Vercel API outage, invalid build config).
+
+**Behaviour**:
+1. All regions are marked `failed`.
+2. `overallStatus` is `failed`.
+3. No rollback is needed.
+4. The root cause must be resolved before re-triggering.
+
+#### Scenario 5: Rollback After Partial Success
+
+**Trigger**: Operator or automated health check determines the partial deployment is unsafe.
+
+**Behaviour**:
+1. All regions (including `healthy` ones) are rolled back to the previous version.
+2. Every region record transitions to `rolled_back`.
+3. `overallStatus` becomes `rolled_back`.
+4. The previous `vercelDeploymentId` is cleared from all records.
+
+### Rollback Decision Criteria
+
+Rollback is triggered automatically when:
+- Post-deploy health check failure rate ≥ 5 % within the first 5 minutes
+- Explicit operator action via the CRAFT dashboard
+
+Rollback is **not** triggered automatically when:
+- Only a subset of regions failed during initial deployment (failover is attempted first)
+- The failure is in a non-primary region and the primary region is healthy
+
+### Recovery Time Objectives
+
+| Scenario | RTO |
+|----------|-----|
+| Single region failover | < 5 minutes |
+| Full rollback | < 10 minutes |
+| All-region failure (Vercel outage) | Dependent on Vercel incident resolution |
+
+### Test Coverage
+
+Multi-region failure scenarios are covered by:
+
+- `apps/backend/tests/deployment/multi-region-fixtures.ts` — reusable fixture constants and factory helpers
+- `apps/backend/tests/deployment/multi-region-failure-recovery.test.ts` — 5 scenario tests with deployment record state assertions
