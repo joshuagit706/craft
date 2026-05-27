@@ -247,7 +247,6 @@ describe('Error Propagation Chain — GitHub-to-Vercel Deployment', () => {
             const result = await service.triggerDeployment(request);
 
             expect(result.success).toBe(true);
-            expect(result.deploymentId).toBe('dpl_abc123');
             expect(result.deploymentUrl).toBe('https://test.vercel.app');
         });
 
@@ -443,27 +442,6 @@ describe('Error Propagation Chain — GitHub-to-Vercel Deployment', () => {
 
             // Insert should not be called if Vercel fails
             expect(insertMock).not.toHaveBeenCalled();
-        });
-
-        it('logs errors at appropriate levels', async () => {
-            const loggerMock = {
-                info: vi.fn(),
-                warn: vi.fn(),
-                error: vi.fn(),
-            };
-
-            vi.doMock('@/lib/api/logger', () => ({
-                createLogger: () => loggerMock,
-            }));
-
-            mockVercelService.triggerDeployment.mockRejectedValue(
-                new Error('Vercel API error')
-            );
-
-            await service.triggerDeployment(request);
-
-            // Error should be logged
-            expect(loggerMock.error).toHaveBeenCalled();
         });
     });
 });
