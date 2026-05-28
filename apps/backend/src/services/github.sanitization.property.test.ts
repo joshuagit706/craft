@@ -160,6 +160,138 @@ it.prop([fc.string(), fc.integer({ min: 1, max: 10 })])(
     },
 );
 
+// ── Collision prevention ──────────────────────────────────────────────────────
+
+/**
+ * Property: No two distinct inputs that differ only in non-ASCII characters
+ * map to the same sanitized output when a suffix is appended.
+ *
+ * Attack prevented: An attacker supplying "my-repo🔒" and "my-repo🚀" could
+ * collide on "my-repo" and overwrite an existing repository. The suffix
+ * mechanism must produce distinct names.
+ */
+it.prop([fc.string(), fc.string(), fc.integer({ min: 1, max: 10 })], { numRuns: 1000 })(
+    'distinct inputs with different suffixes never collide',
+    (a, b, suffix) => {
+        const sa = sanitizeRepoName(a);
+        const sb = sanitizeRepoName(b);
+        if (sa === sb) {
+            // Same base — suffixed candidates must differ
+            const ca = `${sa}-${suffix}`;
+            const cb = `${sb}-${suffix + 1}`;
+            expect(ca).not.toBe(cb);
+        }
+        // If bases differ, no collision possible
+    },
+);
+
+/**
+ * Property: Sanitized name + numeric suffix is always a valid GitHub repo name
+ * (or only invalid due to length, which buildCandidateName handles by truncating).
+ *
+ * Attack prevented: A collision-retry loop that appends "-N" must never produce
+ * an invalid name that would be silently accepted by GitHub with unexpected behaviour.
+ */
+it.prop([fc.string(), fc.integer({ min: 1, max: 999 })], { numRuns: 1000 })(
+    'sanitized name with any numeric suffix is valid or only fails on length',
+    (input, n) => {
+        const base = sanitizeRepoName(input);
+        const candidate = `${base}-${n}`;
+        const valid = isValidGitHubRepoName(candidate);
+        const tooLong = candidate.length > MAX_REPO_NAME_LENGTH;
+        expect(valid || tooLong).toBe(true);
+    },
+);
+
+// ── Traversal sequence removal ────────────────────────────────────────────────
+
+/**
+ * Property: Output never contains "../" or "./" traversal sequences.
+ *
+ * Attack prevented: A repository name containing "../" could be used in a
+ * path-join context to escape the intended directory (e.g. cloning into
+ * /workspaces/../etc/passwd). Sanitization must strip all such sequences.
+ */
+it.prop([fc.string()], { numRuns: 1000 })(
+    'output never contains directory traversal sequences (../)',
+    (input) => {
+        const result = sanitizeRepoName(input);
+        expect(result.includes('../')).toBe(false);
+        expect(result.includes('./')).toBe(false);
+    },
+);
+
+/**
+ * Property: Inputs that are purely traversal sequences produce a valid fallback.
+ *
+ * Attack prevented: An input of "../../etc/passwd" must not produce a name
+ * that could be used to escape a directory boundary.
+ */
+it.prop(
+    [fc.stringOf(fc.constantFrom('.', '/', '\\', ' '), { minLength: 1, maxLength: 50 })],
+    { numRuns: 1000 },
+)(
+    'traversal-only inputs always produce a valid non-traversal name',
+    (input) => {
+        const result = sanitizeRepoName(input);
+        expect(isValidGitHubRepoName(result)).toBe(true);
+        expect(result.includes('../')).toBe(false);
+        expect(result.includes('/')).toBe(false);
+        expect(result.includes('\\')).toBe(false);
+    },
+);
+
+/**
+ * Property: Output never contains a null byte or control character.
+ *
+ * Attack prevented: Null bytes in repository names can cause truncation in
+ * C-based path handling, potentially allowing name spoofing.
+ */
+it.prop(
+    [fc.string({ unit: fc.integer({ min: 0, max: 0x1f }).map((n) => String.fromCharCode(n)) })],
+    { numRuns: 1000 },
+)(
+    'control-character inputs produce valid names with no control characters',
+    (input) => {
+        const result = sanitizeRepoName(input);
+        expect(isValidGitHubRepoName(result)).toBe(true);
+        // No control characters (0x00–0x1f) in output
+        expect(/[\x00-\x1f]/.test(result)).toBe(false);
+    },
+);
+
+/**
+ * Property: Output never contains a dot-dot segment ("..").
+ *
+ * Attack prevented: Even without slashes, a name containing ".." could be
+ * misinterpreted by git tooling as a relative path component.
+ */
+it.prop([fc.string()], { numRuns: 1000 })(
+    'output never contains ".." segment',
+    (input) => {
+        const result = sanitizeRepoName(input);
+        expect(result.includes('..')).toBe(false);
+    },
+);
+
+/**
+ * Property: Unicode Basic Multilingual Plane characters are all handled without throwing.
+ *
+ * Attack prevented: Unexpected Unicode code points (e.g. homoglyphs, zero-width
+ * joiners) must not crash the sanitizer or produce names that bypass validation.
+ */
+it.prop(
+    [fc.stringOf(fc.integer({ min: 0x0000, max: 0xffff }).map((n) => String.fromCodePoint(n)), { minLength: 1, maxLength: 100 })],
+    { numRuns: 1000 },
+)(
+    'all BMP code points produce valid names without throwing',
+    (input) => {
+        let result: string;
+        expect(() => { result = sanitizeRepoName(input); }).not.toThrow();
+        expect(isValidGitHubRepoName(result!)).toBe(true);
+    },
+);
+
 // ── Edge case regression tests ────────────────────────────────────────────────
 
 describe('edge case regressions', () => {

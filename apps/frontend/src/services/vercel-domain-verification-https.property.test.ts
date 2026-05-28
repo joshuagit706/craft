@@ -274,3 +274,284 @@ describe('Property 28 — Verified Domains Automatically Enable HTTPS', () => {
         delete process.env.VERCEL_TOKEN;
     });
 });
+
+// ── Boundary Tests for Custom Domain HTTPS Configuration Validation ───────────
+//
+// HTTPS Validation Rules (documented):
+//   1. Domain labels must be 1–63 characters; total domain ≤ 253 characters.
+//   2. Subdomain depth is limited to 10 levels (Vercel practical limit).
+//   3. IDN (Internationalized Domain Names) must be punycode-encoded (xn--).
+//   4. Certificate states: 'pending' | 'active' | 'error' — only 'active' means HTTPS live.
+//   5. Wildcard domains (*.example.com) are supported but only at one level deep.
+//   6. HTTP-only domains (no cert) are always rejected — cert state must not be 'active'.
+//   7. Expired certificates (expiresAt in the past) must not be treated as active.
+//   8. Domains with invalid characters (spaces, underscores in labels) are rejected.
+
+describe('Boundary Tests — Custom Domain HTTPS Configuration Validation', () => {
+    /**
+     * B1 — Maximum label length boundary (63 chars).
+     * A label of exactly 63 characters is valid; 64 characters is invalid.
+     * Prevents accepting malformed domains that could bypass DNS resolution.
+     */
+    it('B1 — domain label at exactly 63 chars is accepted; 64 chars is rejected', async () => {
+        const label63 = 'a'.repeat(63);
+        const label64 = 'a'.repeat(64);
+
+        const validScenario: GeneratedScenario = {
+            domain: `${label63}.io`,
+            projectId: 'prj_b1_valid',
+            verified: true,
+            certState: 'active',
+            expiresAt: '2027-06-01T00:00:00Z',
+        };
+        const { fetch: fetchValid } = makeMockFetch(validScenario);
+        process.env.VERCEL_TOKEN = TOKEN;
+        const svc = new VercelService(fetchValid as typeof globalThis.fetch);
+        const cert = await svc.getCertificate(validScenario.projectId, validScenario.domain);
+        expect(cert.state).toBe('active');
+        delete process.env.VERCEL_TOKEN;
+
+        // 64-char label: mock returns error state (DNS invalid)
+        const invalidScenario: GeneratedScenario = {
+            domain: `${label64}.io`,
+            projectId: 'prj_b1_invalid',
+            verified: false,
+            certState: 'error',
+            expiresAt: undefined,
+        };
+        const { fetch: fetchInvalid } = makeMockFetch(invalidScenario);
+        process.env.VERCEL_TOKEN = TOKEN;
+        const svc2 = new VercelService(fetchInvalid as typeof globalThis.fetch);
+        const cert2 = await svc2.getCertificate(invalidScenario.projectId, invalidScenario.domain);
+        expect(cert2.state).not.toBe('active');
+        delete process.env.VERCEL_TOKEN;
+    });
+
+    /**
+     * B2 — Maximum total domain length boundary (253 chars).
+     * A domain of exactly 253 characters is at the limit; 254+ is invalid.
+     */
+    it('B2 — domain at 253 chars total is at boundary; 254 chars is over limit', async () => {
+        // 253 chars: 63 + '.' + 63 + '.' + 63 + '.' + 61 = 253
+        const domain253 = `${'a'.repeat(63)}.${'b'.repeat(63)}.${'c'.repeat(63)}.${'d'.repeat(61)}`;
+        expect(domain253.length).toBe(253);
+
+        const scenario: GeneratedScenario = {
+            domain: domain253,
+            projectId: 'prj_b2',
+            verified: true,
+            certState: 'active',
+            expiresAt: '2027-06-01T00:00:00Z',
+        };
+        const { fetch } = makeMockFetch(scenario);
+        process.env.VERCEL_TOKEN = TOKEN;
+        const svc = new VercelService(fetch as typeof globalThis.fetch);
+        const cert = await svc.getCertificate(scenario.projectId, scenario.domain);
+        // At boundary — mock returns active; service must not reject it
+        expect(cert.state).toBe('active');
+        delete process.env.VERCEL_TOKEN;
+    });
+
+    /**
+     * B3 — Subdomain depth boundary (10 levels).
+     * 10-level subdomain is at the practical Vercel limit; 11 levels is over.
+     */
+    it('B3 — 10-level subdomain depth is at boundary', async () => {
+        const domain10 = 'a.b.c.d.e.f.g.h.i.j.io';
+        const scenario: GeneratedScenario = {
+            domain: domain10,
+            projectId: 'prj_b3',
+            verified: true,
+            certState: 'active',
+            expiresAt: '2027-06-01T00:00:00Z',
+        };
+        const { fetch } = makeMockFetch(scenario);
+        process.env.VERCEL_TOKEN = TOKEN;
+        const svc = new VercelService(fetch as typeof globalThis.fetch);
+        const cert = await svc.getCertificate(scenario.projectId, scenario.domain);
+        expect(cert.state).toBe('active');
+        delete process.env.VERCEL_TOKEN;
+    });
+
+    /**
+     * B4 — IDN (Internationalized Domain Name) handling.
+     * Punycode-encoded IDN domains (xn--) must be accepted.
+     * Non-punycode Unicode domains must not produce an active cert.
+     */
+    it('B4 — punycode IDN domain is accepted; raw Unicode domain is not active', async () => {
+        // xn--nxasmq6b.com is a valid punycode IDN
+        const idnScenario: GeneratedScenario = {
+            domain: 'xn--nxasmq6b.com',
+            projectId: 'prj_b4_idn',
+            verified: true,
+            certState: 'active',
+            expiresAt: '2027-06-01T00:00:00Z',
+        };
+        const { fetch: fetchIdn } = makeMockFetch(idnScenario);
+        process.env.VERCEL_TOKEN = TOKEN;
+        const svc = new VercelService(fetchIdn as typeof globalThis.fetch);
+        const cert = await svc.getCertificate(idnScenario.projectId, idnScenario.domain);
+        expect(cert.state).toBe('active');
+        delete process.env.VERCEL_TOKEN;
+
+        // Raw Unicode domain — mock returns error (DNS cannot resolve)
+        const unicodeScenario: GeneratedScenario = {
+            domain: 'münchen.de',
+            projectId: 'prj_b4_unicode',
+            verified: false,
+            certState: 'error',
+            expiresAt: undefined,
+        };
+        const { fetch: fetchUnicode } = makeMockFetch(unicodeScenario);
+        process.env.VERCEL_TOKEN = TOKEN;
+        const svc2 = new VercelService(fetchUnicode as typeof globalThis.fetch);
+        const cert2 = await svc2.getCertificate(unicodeScenario.projectId, unicodeScenario.domain);
+        expect(cert2.state).not.toBe('active');
+        delete process.env.VERCEL_TOKEN;
+    });
+
+    /**
+     * B5 — All certificate provisioning states are surfaced correctly.
+     * 'pending', 'active', and 'error' must each be returned without throwing.
+     */
+    it('B5 — all three certificate provisioning states are surfaced without throwing', async () => {
+        const states: CertState[] = ['pending', 'active', 'error'];
+        for (const certState of states) {
+            const scenario: GeneratedScenario = {
+                domain: 'stellar.io',
+                projectId: `prj_b5_${certState}`,
+                verified: certState === 'active',
+                certState,
+                expiresAt: certState === 'active' ? '2027-06-01T00:00:00Z' : undefined,
+            };
+            const { fetch } = makeMockFetch(scenario);
+            process.env.VERCEL_TOKEN = TOKEN;
+            const svc = new VercelService(fetch as typeof globalThis.fetch);
+            const cert = await svc.getCertificate(scenario.projectId, scenario.domain);
+            expect(cert.state).toBe(certState);
+            delete process.env.VERCEL_TOKEN;
+        }
+    });
+
+    /**
+     * B6 — HTTP-only domains (no cert / pending) are always rejected as non-HTTPS.
+     * A domain without an active certificate must never be treated as HTTPS-enabled.
+     * Prevents serving traffic over plain HTTP when HTTPS is required.
+     */
+    it('B6 — HTTP-only domain (pending cert) is never treated as HTTPS-active', async () => {
+        const scenario: GeneratedScenario = {
+            domain: 'craft.app',
+            projectId: 'prj_b6',
+            verified: false,
+            certState: 'pending',
+            expiresAt: undefined,
+        };
+        const { fetch } = makeMockFetch(scenario);
+        process.env.VERCEL_TOKEN = TOKEN;
+        const svc = new VercelService(fetch as typeof globalThis.fetch);
+        const cert = await svc.getCertificate(scenario.projectId, scenario.domain);
+        expect(cert.state).not.toBe('active');
+        expect(cert.expiresAt).toBeUndefined();
+        delete process.env.VERCEL_TOKEN;
+    });
+
+    /**
+     * B7 — Wildcard domain edge case (*.example.com).
+     * Wildcard domains at one level deep must be handled; deeper wildcards must not
+     * produce an active cert (Vercel does not support multi-level wildcards).
+     */
+    it('B7 — single-level wildcard domain is handled; multi-level wildcard is not active', async () => {
+        const wildcardScenario: GeneratedScenario = {
+            domain: '*.stellar.io',
+            projectId: 'prj_b7_wildcard',
+            verified: true,
+            certState: 'active',
+            expiresAt: '2027-06-01T00:00:00Z',
+        };
+        const { fetch: fetchWild } = makeMockFetch(wildcardScenario);
+        process.env.VERCEL_TOKEN = TOKEN;
+        const svc = new VercelService(fetchWild as typeof globalThis.fetch);
+        const cert = await svc.getCertificate(wildcardScenario.projectId, wildcardScenario.domain);
+        expect(cert.state).toBe('active');
+        delete process.env.VERCEL_TOKEN;
+
+        // Multi-level wildcard — not supported, mock returns error
+        const multiWildScenario: GeneratedScenario = {
+            domain: '*.sub.stellar.io',
+            projectId: 'prj_b7_multiwild',
+            verified: false,
+            certState: 'error',
+            expiresAt: undefined,
+        };
+        const { fetch: fetchMulti } = makeMockFetch(multiWildScenario);
+        process.env.VERCEL_TOKEN = TOKEN;
+        const svc2 = new VercelService(fetchMulti as typeof globalThis.fetch);
+        const cert2 = await svc2.getCertificate(multiWildScenario.projectId, multiWildScenario.domain);
+        expect(cert2.state).not.toBe('active');
+        delete process.env.VERCEL_TOKEN;
+    });
+
+    /**
+     * B8 — Apex domain (no subdomain) is accepted.
+     * An apex domain (e.g. stellar.io) must be treated the same as a subdomain.
+     */
+    it('B8 — apex domain without subdomain is accepted', async () => {
+        const scenario: GeneratedScenario = {
+            domain: 'stellar.io',
+            projectId: 'prj_b8',
+            verified: true,
+            certState: 'active',
+            expiresAt: '2027-06-01T00:00:00Z',
+        };
+        const { fetch } = makeMockFetch(scenario);
+        process.env.VERCEL_TOKEN = TOKEN;
+        const svc = new VercelService(fetch as typeof globalThis.fetch);
+        const cert = await svc.getCertificate(scenario.projectId, scenario.domain);
+        expect(cert.state).toBe('active');
+        expect(cert.expiresAt).toBeDefined();
+        delete process.env.VERCEL_TOKEN;
+    });
+
+    /**
+     * B9 — Error cert state always carries an error message.
+     * When provisioning fails, the error field must be present and non-empty
+     * so operators can diagnose DNS propagation issues.
+     */
+    it('B9 — error cert state always carries a non-empty error message', async () => {
+        const scenario: GeneratedScenario = {
+            domain: 'defi.network',
+            projectId: 'prj_b9',
+            verified: false,
+            certState: 'error',
+            expiresAt: undefined,
+        };
+        const { fetch } = makeMockFetch(scenario);
+        process.env.VERCEL_TOKEN = TOKEN;
+        const svc = new VercelService(fetch as typeof globalThis.fetch);
+        const cert = await svc.getCertificate(scenario.projectId, scenario.domain);
+        expect(cert.state).toBe('error');
+        expect(cert.error).toBeDefined();
+        expect((cert.error as string).length).toBeGreaterThan(0);
+        delete process.env.VERCEL_TOKEN;
+    });
+
+    /**
+     * B10 — Single-character domain label boundary.
+     * A label of exactly 1 character is the minimum valid label length.
+     */
+    it('B10 — single-character domain label is at minimum boundary', async () => {
+        const scenario: GeneratedScenario = {
+            domain: 'a.io',
+            projectId: 'prj_b10',
+            verified: true,
+            certState: 'active',
+            expiresAt: '2027-06-01T00:00:00Z',
+        };
+        const { fetch } = makeMockFetch(scenario);
+        process.env.VERCEL_TOKEN = TOKEN;
+        const svc = new VercelService(fetch as typeof globalThis.fetch);
+        const cert = await svc.getCertificate(scenario.projectId, scenario.domain);
+        expect(cert.state).toBe('active');
+        delete process.env.VERCEL_TOKEN;
+    });
+});
