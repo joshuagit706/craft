@@ -13,6 +13,20 @@ export type InvokeContractResult<T = SorobanRpc.Api.SimulateTransactionResponse>
     | { ok: true; result: T }
     | { ok: false; error: AppError };
 
+/**
+ * Maximum Soroban contract WASM binary size in bytes.
+ * Based on Soroban network deployment constraints.
+ * @see https://developers.stellar.org/docs/smart-contracts/limits-and-fees
+ */
+export const MAX_WASM_SIZE_BYTES = 65536; // 64 KB
+
+export interface WasmValidationResult {
+    valid: boolean;
+    size?: number;
+    maxSize: number;
+    error?: string;
+}
+
 const SOROBAN_RPC_URLS = {
     mainnet: 'https://soroban-mainnet.stellar.org',
     testnet: 'https://soroban-testnet.stellar.org',
@@ -260,5 +274,63 @@ export async function invokeContractMethod(
                     : 400,
             },
         };
+    }
+}
+
+/**
+ * Validates Soroban contract WASM binary size against network deployment constraints.
+ *
+ * @param wasmBinary - The WASM binary as Buffer or Uint8Array
+ * @returns Validation result with size information and error details
+ *
+ * @example
+ * ```typescript
+ * const wasm = fs.readFileSync('contract.wasm');
+ * const result = validateWasmSize(wasm);
+ * if (!result.valid) {
+ *   console.error(result.error);
+ *   console.log(`Binary size: ${result.size} bytes, Max: ${result.maxSize} bytes`);
+ * }
+ * ```
+ */
+export function validateWasmSize(wasmBinary: Buffer | Uint8Array): WasmValidationResult {
+    const size = wasmBinary.length;
+
+    if (size > MAX_WASM_SIZE_BYTES) {
+        return {
+            valid: false,
+            size,
+            maxSize: MAX_WASM_SIZE_BYTES,
+            error: `WASM binary size (${size} bytes) exceeds maximum allowed size (${MAX_WASM_SIZE_BYTES} bytes). Reduce contract size by ${size - MAX_WASM_SIZE_BYTES} bytes.`,
+        };
+    }
+
+    return {
+        valid: true,
+        size,
+        maxSize: MAX_WASM_SIZE_BYTES,
+    };
+}
+
+/**
+ * Validates WASM binary before deployment and throws if invalid.
+ *
+ * @param wasmBinary - The WASM binary to validate
+ * @throws Error if WASM binary exceeds size limit
+ *
+ * @example
+ * ```typescript
+ * try {
+ *   assertValidWasmSize(wasmBinary);
+ *   // Proceed with deployment
+ * } catch (error) {
+ *   console.error('Deployment blocked:', error.message);
+ * }
+ * ```
+ */
+export function assertValidWasmSize(wasmBinary: Buffer | Uint8Array): void {
+    const result = validateWasmSize(wasmBinary);
+    if (!result.valid) {
+        throw new Error(result.error);
     }
 }
