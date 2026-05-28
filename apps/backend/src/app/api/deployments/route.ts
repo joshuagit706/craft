@@ -3,6 +3,7 @@ import type { NextRequest } from 'next/server';
 import { withAuth } from '@/lib/api/with-auth';
 import { ApiVersionRouter } from '@/lib/api/versioning';
 import { getEntitlements } from '@/lib/stripe/pricing';
+import { isDraining } from '@/lib/shutdown-manager';
 import type { SubscriptionTier } from '@craft/types';
 import {
   validateCustomizationConfig,
@@ -64,28 +65,8 @@ deploymentRouter.register('GET', {
       .from('deployments')
       .select('id, name, status, template_id, created_at, updated_at, deployed_at, deployment_url')
       .eq('user_id', user.id)
-      .order('created_at', { ascending: false })
-      .limit(limit + 1);
-
-    if (cursor) {
-      const decoded = decodeCursor(cursor);
-      if (!decoded) {
-        return NextResponse.json(
-          { error: 'Invalid cursor' },
-          { status: 400 },
-        );
-      }
-
-      if (direction === 'prev') {
-        query = query.gt('created_at', decoded.createdAt)
-          .or(`created_at.eq.${decoded.createdAt},id.gt.${decoded.id}`);
-      } else {
-        query = query.lt('created_at', decoded.createdAt)
-          .or(`created_at.eq.${decoded.createdAt},id.lt.${decoded.id}`);
-      }
-    }
-
-    const { data: deployments, error } = await query;
+      .is('deleted_at', null)
+      .order('created_at', { ascending: false });
 
     if (error) {
       return NextResponse.json(
@@ -129,6 +110,13 @@ deploymentRouter.register('GET', {
 deploymentRouter.register('POST', {
   supportedVersions: ['v1'],
   handler: async (req: NextRequest, { supabase, user }: any) => {
+    if (isDraining()) {
+      return NextResponse.json(
+        { error: 'Server is shutting down. Please retry shortly.' },
+        { status: 503, headers: { 'Retry-After': '30' } },
+      );
+    }
+
     let body: RequestBody;
     try {
       const raw = await req.json();
@@ -171,7 +159,7 @@ deploymentRouter.register('POST', {
         .from('deployments')
         .select('id', { count: 'exact', head: true })
         .eq('user_id', user.id)
-        .eq('is_active', true);
+        .is('deleted_at', null);
 
       if ((count ?? 0) >= maxDeployments) {
         return NextResponse.json(
