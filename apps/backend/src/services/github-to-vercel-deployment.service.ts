@@ -25,6 +25,7 @@
 import { createClient } from '@/lib/supabase/server';
 import { VercelService } from './vercel.service';
 import { createLogger } from '@/lib/api/logger';
+import { startTrace, newSpan, withSpan, type TraceContext } from '@/lib/tracing';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -49,6 +50,8 @@ export interface TriggerDeploymentResult {
     deploymentUrl?: string;
     status?: string;
     errorMessage?: string;
+    /** W3C traceparent identifying this deployment across all pipeline stages. */
+    traceId?: string;
 }
 
 export interface DeploymentMetadata {
@@ -89,77 +92,103 @@ export class GitHubToVercelDeploymentService {
      * @returns Deployment trigger result
      */
     async triggerDeployment(request: TriggerDeploymentRequest): Promise<TriggerDeploymentResult> {
+        // Generate root trace context for this deployment — propagated through all stages.
+        const trace = startTrace();
         const correlationId = crypto.randomUUID();
-        const log = createLogger({ correlationId, service: 'github-to-vercel-deployment' });
+        const log = createLogger({ correlationId, service: 'github-to-vercel-deployment', traceId: trace.traceId });
 
-        // 1. Validate environment variables
-        const vercelProjectId = process.env.VERCEL_PROJECT_ID;
-        if (!vercelProjectId) {
-            log.error('VERCEL_PROJECT_ID is not configured');
-            return {
-                success: false,
-                deploymentId: '',
-                errorMessage: 'VERCEL_PROJECT_ID is not configured',
-            };
-        }
-
-        log.info('Triggering Vercel deployment', {
+        log.info('Deployment pipeline started', {
+            traceId: trace.traceId,
             repoFullName: request.repoFullName,
             branch: request.branch,
             commitSha: request.commitSha.substring(0, 7),
         });
 
+        // Stage 1: Validate environment
+        const { result: vercelProjectId, durationMs: envMs } = await withSpan(
+            'validate-env',
+            trace.traceId,
+            async (_span) => process.env.VERCEL_PROJECT_ID ?? null,
+        );
+
+        log.info('Stage: validate-env', { traceId: trace.traceId, durationMs: envMs });
+
+        if (!vercelProjectId) {
+            log.error('VERCEL_PROJECT_ID is not configured', undefined, { traceId: trace.traceId });
+            return { success: false, deploymentId: '', errorMessage: 'VERCEL_PROJECT_ID is not configured', traceId: trace.traceId };
+        }
+
         try {
-            // 2. Trigger Vercel deployment
-            const deployment = await this._vercelService.triggerDeployment(
-                vercelProjectId,
-                request.repoFullName
+            // Stage 2: Trigger Vercel deployment
+            const { result: deployment, durationMs: vercelMs, spanId: vercelSpanId } = await withSpan(
+                'trigger-vercel',
+                trace.traceId,
+                async (span) => {
+                    log.info('Stage: trigger-vercel', { traceId: trace.traceId, spanId: span.spanId });
+                    return this._vercelService.triggerDeployment(vercelProjectId, request.repoFullName);
+                },
             );
 
             log.info('Vercel deployment triggered', {
+                traceId: trace.traceId,
+                spanId: vercelSpanId,
+                durationMs: vercelMs,
                 deploymentId: deployment.deploymentId,
                 deploymentUrl: deployment.deploymentUrl,
                 status: deployment.status,
             });
 
-            // 3. Store deployment metadata in Supabase
+            // Stage 3: Persist metadata
             const deploymentId = crypto.randomUUID();
-            const supabase = createClient();
+            const { durationMs: storeMs, spanId: storeSpanId } = await withSpan(
+                'store-metadata',
+                trace.traceId,
+                async (span) => {
+                    log.info('Stage: store-metadata', { traceId: trace.traceId, spanId: span.spanId });
+                    const supabase = createClient();
+                    const { error: insertError } = await supabase.from('github_vercel_deployments').insert({
+                        id: deploymentId,
+                        repo_full_name: request.repoFullName,
+                        repo_name: request.repoName,
+                        branch: request.branch,
+                        commit_sha: request.commitSha,
+                        commit_message: request.commitMessage,
+                        pusher_name: request.pusherName,
+                        vercel_deployment_id: deployment.deploymentId,
+                        vercel_deployment_url: deployment.deploymentUrl,
+                        status: this.mapVercelStatus(deployment.status),
+                        trace_id: trace.traceId,
+                        created_at: new Date().toISOString(),
+                        updated_at: new Date().toISOString(),
+                    });
+                    if (insertError) {
+                        log.error('Failed to store deployment metadata', insertError, { traceId: trace.traceId });
+                    }
+                    return null;
+                },
+            );
 
-            const { error: insertError } = await supabase.from('github_vercel_deployments').insert({
-                id: deploymentId,
-                repo_full_name: request.repoFullName,
-                repo_name: request.repoName,
-                branch: request.branch,
-                commit_sha: request.commitSha,
-                commit_message: request.commitMessage,
-                pusher_name: request.pusherName,
-                vercel_deployment_id: deployment.deploymentId,
-                vercel_deployment_url: deployment.deploymentUrl,
-                status: this.mapVercelStatus(deployment.status),
-                created_at: new Date().toISOString(),
-                updated_at: new Date().toISOString(),
+            log.info('Deployment pipeline complete', {
+                traceId: trace.traceId,
+                spanId: storeSpanId,
+                durationMs: storeMs,
+                deploymentId,
             });
-
-            if (insertError) {
-                log.error('Failed to store deployment metadata', insertError);
-                // Don't fail the deployment if storage fails, but log it
-            }
-
-            log.info('Deployment metadata stored', { deploymentId });
 
             return {
                 success: true,
                 deploymentId,
                 deploymentUrl: deployment.deploymentUrl,
                 status: deployment.status,
+                traceId: trace.traceId,
             };
         } catch (error: any) {
-            log.error('Failed to trigger Vercel deployment', error);
+            log.error('Deployment pipeline failed', error, { traceId: trace.traceId });
             return {
                 success: false,
                 deploymentId: '',
                 errorMessage: error.message || 'Failed to trigger deployment',
+                traceId: trace.traceId,
             };
         }
     }
@@ -173,11 +202,12 @@ export class GitHubToVercelDeploymentService {
      * @param vercelDeploymentId - Vercel deployment ID
      * @returns Updated deployment metadata or null if not found
      */
-    async syncDeploymentStatus(vercelDeploymentId: string): Promise<DeploymentMetadata | null> {
+    async syncDeploymentStatus(vercelDeploymentId: string, existingTraceId?: string): Promise<DeploymentMetadata | null> {
         const correlationId = crypto.randomUUID();
-        const log = createLogger({ correlationId, service: 'github-to-vercel-deployment-sync' });
+        const traceCtx = existingTraceId ? newSpan(existingTraceId) : startTrace();
+        const log = createLogger({ correlationId, service: 'github-to-vercel-deployment-sync', traceId: traceCtx.traceId });
 
-        log.info('Syncing deployment status', { vercelDeploymentId });
+        log.info('Syncing deployment status', { vercelDeploymentId, traceId: traceCtx.traceId });
 
         try {
             // Get deployment status from Vercel

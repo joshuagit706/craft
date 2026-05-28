@@ -530,13 +530,84 @@ components:
 
     Error:
       type: object
+      required: [code, category, message]
       properties:
-        message:
-          type: string
         code:
           type: string
+          description: >
+            Stable machine-readable error code. Never changes once published.
+            Safe to switch on in client code.
+          enum:
+            # Validation
+            - VALIDATION_INVALID_JSON
+            - VALIDATION_SCHEMA_ERROR
+            - VALIDATION_MISSING_FIELD
+            - VALIDATION_INVALID_FIELD
+            # Auth
+            - AUTH_UNAUTHENTICATED
+            - AUTH_FORBIDDEN
+            - AUTH_INVALID_CREDENTIALS
+            - AUTH_EMAIL_TAKEN
+            - AUTH_TOKEN_EXPIRED
+            - AUTH_TOKEN_INVALID
+            - AUTH_TOKEN_NOT_CONNECTED
+            # GitHub
+            - GITHUB_AUTH_FAILED
+            - GITHUB_RATE_LIMITED
+            - GITHUB_COLLISION
+            - GITHUB_NETWORK_ERROR
+            - GITHUB_CONFIGURATION_ERROR
+            - GITHUB_NOT_FOUND
+            # Vercel
+            - VERCEL_AUTH_FAILED
+            - VERCEL_RATE_LIMITED
+            - VERCEL_PROJECT_EXISTS
+            - VERCEL_NETWORK_ERROR
+            - VERCEL_NOT_FOUND
+            # Stripe
+            - STRIPE_CARD_DECLINED
+            - STRIPE_WEBHOOK_INVALID
+            - STRIPE_SUBSCRIPTION_NOT_FOUND
+            - STRIPE_NETWORK_ERROR
+            # Stellar
+            - STELLAR_INSUFFICIENT_BALANCE
+            - STELLAR_NETWORK_MISMATCH
+            - STELLAR_TRANSACTION_FAILED
+            - STELLAR_ENDPOINT_UNREACHABLE
+            - STELLAR_CONTRACT_INVALID
+            # Internal
+            - INTERNAL_SERVER_ERROR
+            - INTERNAL_DATABASE_ERROR
+            - INTERNAL_CONFIGURATION_ERROR
+        category:
+          type: string
+          description: Top-level error group for client-side branching.
+          enum: [validation, auth, external, internal]
+        message:
+          type: string
+          description: Short, user-facing message. Never contains stack traces.
         details:
           type: object
+          description: Optional field-level detail (e.g. Zod validation errors).
+          additionalProperties: true
+        correlationId:
+          type: string
+          description: >
+            Server-side correlation ID for tracing this error in logs.
+            Include in support requests.
+
+    # ── Error Taxonomy ──────────────────────────────────────────────────────
+    #
+    # Categories and their default HTTP status codes:
+    #
+    #   validation  →  400 Bad Request
+    #   auth        →  401 Unauthorized / 403 Forbidden / 409 Conflict
+    #   external    →  402 / 404 / 409 / 422 / 429 / 502 (varies by code)
+    #   internal    →  500 Internal Server Error
+    #
+    # Stability guarantee: error codes are never renamed or removed.
+    # New codes may be added in minor versions.
+    # ────────────────────────────────────────────────────────────────────────
 
   securitySchemes:
     bearerAuth:
