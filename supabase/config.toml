@@ -36,3 +36,30 @@ enable_signup = true
 enable_signup = true
 double_confirm_changes = true
 enable_confirmations = false
+
+[functions]
+verify_jwt = false
+import_map = "functions/import_map.json"
+
+# Regional Auth Functions
+[functions."regional-auth-sign-up"]
+key = "regional-auth-sign-up"
+verify_jwt = false
+
+[functions."regional-auth-sign-in"]
+key = "regional-auth-sign-in"
+verify_jwt = false
+
+[functions."regional-auth-token-refresh"]
+key = "regional-auth-token-refresh"
+verify_jwt = false
+
+# Regional Health Check
+[functions."regional-health-check"]
+key = "regional-health-check"
+verify_jwt = false
+
+# Regional Router
+[functions."regional-router"]
+key = "regional-router"
+verify_jwt = false
