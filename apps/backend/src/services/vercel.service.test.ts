@@ -1114,6 +1114,121 @@ describe('VercelService — getDeploymentLogs', () => {
     });
 });
 
+// ── Blue-green alias promotion (Issue #645) ──────────────────────────────────
+
+describe('Blue-green alias promotion', () => {
+    beforeEach(() => {
+        process.env.VERCEL_TOKEN = 'test_token';
+    });
+
+    afterEach(() => {
+        delete process.env.VERCEL_TOKEN;
+    });
+
+    describe('promoteToProduction', () => {
+        it('promotes staging deployment to production alias', async () => {
+            const { svc, mockFetch } = makeService();
+
+            // Mock listDeploymentAliases to return current production alias
+            mockFetch.mockResolvedValueOnce(
+                makeResponse(200, {
+                    aliases: [
+                        {
+                            uid: 'alias_prod',
+                            alias: 'example.com',
+                            created: '2024-01-01T00:00:00Z',
+                            redirect: 'dpl_old_prod',
+                        },
+                    ],
+                }),
+            );
+
+            // Mock assignAliasToDeployment
+            mockFetch.mockResolvedValueOnce(
+                makeResponse(200, {
+                    uid: 'alias_prod',
+                    alias: 'example.com',
+                    created: '2024-01-01T00:00:00Z',
+                    redirect: null,
+                }),
+            );
+
+            const result = await svc.promoteToProduction('dpl_staging', 'example.com');
+
+            expect(result.success).toBe(true);
+            expect(result.previousProductionDeploymentId).toBe('dpl_old_prod');
+        });
+
+        it('returns undefined previousProductionDeploymentId when no prior production deployment', async () => {
+            const { svc, mockFetch } = makeService();
+
+            // Mock listDeploymentAliases with no existing alias
+            mockFetch.mockResolvedValueOnce(
+                makeResponse(200, { aliases: [] }),
+            );
+
+            // Mock assignAliasToDeployment
+            mockFetch.mockResolvedValueOnce(
+                makeResponse(200, {
+                    uid: 'alias_prod',
+                    alias: 'example.com',
+                }),
+            );
+
+            const result = await svc.promoteToProduction('dpl_staging', 'example.com');
+
+            expect(result.success).toBe(true);
+            expect(result.previousProductionDeploymentId).toBeUndefined();
+        });
+
+        it('throws on promotion failure', async () => {
+            const { svc, mockFetch } = makeService();
+
+            mockFetch.mockResolvedValueOnce(
+                makeResponse(200, { aliases: [] }),
+            );
+
+            mockFetch.mockResolvedValueOnce(
+                makeResponse(429, { error: { message: 'Rate limited' } }),
+            );
+
+            await expect(svc.promoteToProduction('dpl_staging', 'example.com')).rejects.toMatchObject({
+                code: 'RATE_LIMITED',
+            });
+        });
+    });
+
+    describe('rollbackProduction', () => {
+        it('rolls back production alias to previous deployment', async () => {
+            const { svc, mockFetch } = makeService();
+
+            mockFetch.mockResolvedValueOnce(
+                makeResponse(200, {
+                    uid: 'alias_prod',
+                    alias: 'example.com',
+                    created: '2024-01-01T00:00:00Z',
+                }),
+            );
+
+            const result = await svc.rollbackProduction('dpl_previous_prod', 'example.com');
+
+            expect(result.success).toBe(true);
+        });
+
+        it('throws on rollback failure', async () => {
+            const { svc, mockFetch } = makeService();
+
+            mockFetch.mockResolvedValueOnce(
+                makeResponse(500, { error: { message: 'Server error' } }),
+            );
+
+            await expect(svc.rollbackProduction('dpl_previous', 'example.com')).rejects.toMatchObject({
+                code: 'UNKNOWN',
+            });
+        });
+    });
+});
+
 const MOCK_TOKEN = 'test_token';
 
 function makeResponse(

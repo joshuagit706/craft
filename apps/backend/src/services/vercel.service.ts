@@ -880,6 +880,72 @@ export class VercelService {
         });
     }
 
+    // ── Blue-green alias promotion (Issue #645) ──────────────────────────────
+
+    /**
+     * Deploy to staging alias first, atomically promoting to production.
+     * Stores the previous production deployment ID for rollback capability.
+     *
+     * @param projectId - Vercel project ID
+     * @param stagingAlias - Alias for staging (e.g., "staging.example.com")
+     * @param productionAlias - Alias for production (e.g., "example.com")
+     * @param currentProductionDeploymentId - Current production deployment ID (for rollback)
+     * @returns Result with staging and production deployment IDs
+     */
+    async promoteToProduction(
+        stagingDeploymentId: string,
+        productionAlias: string,
+    ): Promise<{ success: boolean; previousProductionDeploymentId?: string }> {
+        try {
+            // Get current production alias target to enable rollback
+            const aliases = await this.listDeploymentAliases(stagingDeploymentId);
+            const currentProductionAlias = aliases.find((a) => a.alias === productionAlias);
+            const previousProductionDeploymentId = currentProductionAlias?.redirect ?? undefined;
+
+            // Atomically reassign production alias to staging deployment
+            await this.assignAliasToDeployment(stagingDeploymentId, productionAlias);
+
+            return {
+                success: true,
+                previousProductionDeploymentId,
+            };
+        } catch (error: unknown) {
+            if (error instanceof VercelApiError) {
+                throw error;
+            }
+            throw new VercelApiError(
+                error instanceof Error ? error.message : 'Promotion to production failed',
+                'UNKNOWN',
+            );
+        }
+    }
+
+    /**
+     * Rollback production alias to previous deployment.
+     * Requires that previousProductionDeploymentId was stored from the previous promotion.
+     *
+     * @param previousProductionDeploymentId - Deployment ID to rollback to
+     * @param productionAlias - Alias to repoint
+     * @returns Success status
+     */
+    async rollbackProduction(
+        previousProductionDeploymentId: string,
+        productionAlias: string,
+    ): Promise<{ success: boolean }> {
+        try {
+            await this.assignAliasToDeployment(previousProductionDeploymentId, productionAlias);
+            return { success: true };
+        } catch (error: unknown) {
+            if (error instanceof VercelApiError) {
+                throw error;
+            }
+            throw new VercelApiError(
+                error instanceof Error ? error.message : 'Rollback failed',
+                'UNKNOWN',
+            );
+        }
+    }
+
     // ── Private helpers ───────────────────────────────────────────────────────
 
 
