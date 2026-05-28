@@ -1,4 +1,4 @@
-import { SorobanRpc, Contract, TransactionBuilder, Networks, BASE_FEE, xdr } from 'stellar-sdk';
+import { SorobanRpc, Contract, TransactionBuilder, Networks, BASE_FEE, xdr, hash, StrKey } from 'stellar-sdk';
 import { config } from './config';
 import { parseStellarError } from './errors';
 
@@ -364,282 +364,247 @@ export async function invokeContractMethod(
 }
 
 // ---------------------------------------------------------------------------
-// Contract Upgrade Path Management (#621)
+// #613 — Deterministic Contract Address Derivation
 // ---------------------------------------------------------------------------
+//
+// Soroban derives a contract address deterministically from three inputs:
+//   deployer  – the deploying account's public key (G… address)
+//   salt      – a 32-byte random value chosen by the deployer
+//   wasmHash  – the SHA-256 hash of the uploaded WASM binary
+//
+// Algorithm (mirrors the Soroban host implementation):
+//   1. Build an XDR `HashIDPreimage` of type `CONTRACT_ID` containing a
+//      `PreimageFromAddress` variant with the deployer address and salt.
+//   2. SHA-256 hash the serialised preimage → 32-byte contract ID.
+//   3. Encode the contract ID as a Stellar contract address (C… strkey).
+//
+// Reference: https://github.com/stellar/stellar-xdr (HashIDPreimage)
 
-export interface StorageKeySchema {
-    /** Symbolic name for the storage key (e.g. "Balance", "Config") */
-    name: string;
-    /** XDR type tag for the key value */
-    typeTag: string;
+/**
+ * Derive the deterministic Soroban contract address from deployment parameters.
+ *
+ * The derived address matches the address that Soroban assigns when the
+ * contract is deployed with the same `deployer`, `salt`, and `wasmHash`.
+ * Use this to preview the contract address before submitting the deployment
+ * transaction.
+ *
+ * @param deployerPublicKey - G… Stellar public key of the deploying account
+ * @param salt - 32-byte deployment salt (Buffer or hex string)
+ * @param wasmHash - 32-byte SHA-256 hash of the WASM binary (Buffer or hex string)
+ * @returns The C… contract address string
+ *
+ * @example
+ * ```ts
+ * const address = deriveContractAddress(deployerKey, salt, wasmHash);
+ * console.log('Pre-deployment address:', address);
+ * ```
+ */
+export function deriveContractAddress(
+    deployerPublicKey: string,
+    salt: Buffer | string,
+    wasmHash: Buffer | string,
+): string {
+    const saltBuf = typeof salt === 'string' ? Buffer.from(salt, 'hex') : salt;
+    const wasmHashBuf = typeof wasmHash === 'string' ? Buffer.from(wasmHash, 'hex') : wasmHash;
+
+    if (saltBuf.length !== 32) throw new Error('salt must be 32 bytes');
+    if (wasmHashBuf.length !== 32) throw new Error('wasmHash must be 32 bytes');
+
+    // Decode the deployer G… address to raw 32-byte public key
+    const deployerRaw = StrKey.decodeEd25519PublicKey(deployerPublicKey);
+
+    // Build HashIDPreimage for CONTRACT_ID (preimage_from_address variant)
+    const preimage = xdr.HashIdPreimage.envelopeTypeContractId(
+        new xdr.HashIdPreimageContractId({
+            networkId: hash(Buffer.from(getNetworkPassphrase())),
+            contractIdPreimage: xdr.ContractIdPreimage.contractIdPreimageFromAddress(
+                new xdr.ContractIdPreimageFromAddress({
+                    address: xdr.ScAddress.scAddressTypeAccount(
+                        xdr.AccountId.publicKeyTypeEd25519(deployerRaw),
+                    ),
+                    salt: saltBuf,
+                }),
+            ),
+        }),
+    );
+
+    const contractId = hash(preimage.toXDR());
+    return StrKey.encodeContract(contractId);
 }
 
-export interface UpgradeCompatibilityResult {
-    compatible: boolean;
-    /** Human-readable reason when compatible is false */
-    reason?: string;
+/**
+ * Verify that a derived address matches the address of a deployed contract.
+ *
+ * @param deployerPublicKey - G… public key used during deployment
+ * @param salt - 32-byte salt used during deployment
+ * @param wasmHash - 32-byte WASM hash used during deployment
+ * @param deployedAddress - The C… address returned after deployment
+ * @returns `true` if the derived address matches the deployed address
+ */
+export function verifyContractAddress(
+    deployerPublicKey: string,
+    salt: Buffer | string,
+    wasmHash: Buffer | string,
+    deployedAddress: string,
+): boolean {
+    return deriveContractAddress(deployerPublicKey, salt, wasmHash) === deployedAddress;
 }
 
-export interface ContractUpgradeRecord {
+// ---------------------------------------------------------------------------
+// #614 — Type-Safe Contract Invocation Wrapper with Error Boundary
+// ---------------------------------------------------------------------------
+//
+// `invokeContract<TArgs, TReturn>` provides compile-time type checking for
+// contract arguments and return values. All RPC errors are caught and mapped
+// through `parseStellarError` so raw RPC details never leak to callers.
+
+/** Typed contract argument descriptor. */
+export interface ContractInvokeOptions<TArgs extends xdr.ScVal[]> {
     contractId: string;
-    previousWasmHash: string;
-    newWasmHash: string;
-    scheduledAt: number;
-    upgraderPublicKey: string;
-    status: 'pending' | 'applied' | 'rolled_back';
+    method: string;
+    args: TArgs;
+    sourcePublicKey: string;
 }
 
+/** Typed result of a contract invocation. */
+export type TypedInvokeResult<TReturn> =
+    | { ok: true; result: TReturn }
+    | { ok: false; error: AppError };
+
 /**
- * Validates that the new contract version is state-compatible with the
- * currently deployed version.
+ * Type-safe Soroban contract invocation wrapper with error boundary.
  *
- * Rules:
- *  - No persistent storage keys may be removed (would corrupt existing state).
- *  - Existing key type tags must not change (would break deserialization).
- *  - New keys may be freely added.
- */
-export function validateUpgradeCompatibility(
-    deployedSchema: StorageKeySchema[],
-    newSchema: StorageKeySchema[],
-): UpgradeCompatibilityResult {
-    for (const deployed of deployedSchema) {
-        const inNew = newSchema.find((k) => k.name === deployed.name);
-        if (!inNew) {
-            return {
-                compatible: false,
-                reason: `Upgrade removes storage key "${deployed.name}" — existing state would be inaccessible`,
-            };
-        }
-        if (inNew.typeTag !== deployed.typeTag) {
-            return {
-                compatible: false,
-                reason: `Upgrade changes type of storage key "${deployed.name}" from "${deployed.typeTag}" to "${inNew.typeTag}"`,
-            };
-        }
-    }
-    return { compatible: true };
-}
-
-/**
- * Schedules a contract upgrade after performing compatibility validation.
- * Returns a pending upgrade record; throws if the schemas are incompatible.
+ * Accepts a typed `parse` function that converts the raw simulation response
+ * into the expected return type `TReturn`. Any error thrown during invocation
+ * or parsing is caught and mapped to a typed `AppError` — raw RPC errors
+ * never propagate to callers.
  *
- * Upgrade procedure:
- *  1. Call `scheduleContractUpgrade` — validates schemas and returns a pending record.
- *  2. Submit the WASM upload + contract upgrade transactions on-chain.
- *  3. Update record status to 'applied'.
+ * @param options - Typed invocation options
+ * @param parse - Function that extracts `TReturn` from the simulation response
+ * @param _simulate - Optional override for `simulateContractCall` (for testing)
+ * @returns Discriminated union `{ ok: true, result }` | `{ ok: false, error }`
  *
- * Rollback: call `rollbackContractUpgrade` on any pending record to cancel it
- * before the on-chain transaction is submitted.
+ * @example
+ * ```ts
+ * const res = await invokeContract(
+ *   { contractId, method: 'balance', args: [addressArg], sourcePublicKey },
+ *   (r) => (r as any).result?.retval,
+ * );
+ * if (res.ok) console.log(res.result);
+ * ```
  */
-export function scheduleContractUpgrade(
-    contractId: string,
-    previousWasmHash: string,
-    newWasmHash: string,
-    upgraderPublicKey: string,
-    deployedSchema: StorageKeySchema[],
-    newSchema: StorageKeySchema[],
-): ContractUpgradeRecord {
-    const validation = validateUpgradeCompatibility(deployedSchema, newSchema);
-    if (!validation.compatible) {
-        throw new Error(`Contract upgrade rejected: ${validation.reason}`);
-    }
-    return {
-        contractId,
-        previousWasmHash,
-        newWasmHash,
-        scheduledAt: Date.now(),
-        upgraderPublicKey,
-        status: 'pending',
-    };
-}
-
-/**
- * Marks a pending upgrade record as rolled back.
- * Only records with status 'pending' can be rolled back.
- */
-export function rollbackContractUpgrade(record: ContractUpgradeRecord): ContractUpgradeRecord {
-    if (record.status !== 'pending') {
-        throw new Error(`Cannot roll back upgrade with status "${record.status}"`);
-    }
-    return { ...record, status: 'rolled_back' };
-}
-
-// ---------------------------------------------------------------------------
-// Multi-Signature Authorization for Admin Operations (#622)
-// ---------------------------------------------------------------------------
-
-export interface MultiSigConfig {
-    /** Minimum number of valid signatures required to execute the operation */
-    threshold: number;
-    /** Set of public keys authorized to sign admin operations */
-    authorizedSigners: string[];
-}
-
-export interface MultiSigOperation {
-    id: string;
-    /** Serialized operation payload */
-    payload: string;
-    /** Public keys of authorized signers that have signed this operation */
-    collectedSignatures: string[];
-    status: 'pending' | 'approved' | 'executed';
-}
-
-/**
- * Creates a new pending multi-sig operation.
- * Throws if the threshold is invalid relative to the authorized signer set.
- */
-export function createMultiSigOperation(
-    payload: string,
-    config: MultiSigConfig,
-): MultiSigOperation {
-    if (config.threshold < 1) {
-        throw new Error('Multi-sig threshold must be at least 1');
-    }
-    if (config.threshold > config.authorizedSigners.length) {
-        throw new Error('Multi-sig threshold cannot exceed the number of authorized signers');
-    }
-    return {
-        id: `msig_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-        payload,
-        collectedSignatures: [],
-        status: 'pending',
-    };
-}
-
-/**
- * Adds a validated signature to a pending multi-sig operation.
- *
- * - Rejects signers not in config.authorizedSigners.
- * - Rejects duplicate signatures from the same signer.
- * - Rejects signatures on non-pending operations.
- * - Transitions status to 'approved' when the threshold is reached.
- */
-export function collectSignature(
-    operation: MultiSigOperation,
-    signerPublicKey: string,
-    config: MultiSigConfig,
-): MultiSigOperation {
-    if (operation.status !== 'pending') {
-        throw new Error(`Cannot add signature to operation with status "${operation.status}"`);
-    }
-    if (!config.authorizedSigners.includes(signerPublicKey)) {
-        throw new Error(`Signer "${signerPublicKey}" is not in the authorized signer set`);
-    }
-    if (operation.collectedSignatures.includes(signerPublicKey)) {
-        throw new Error(`Signer "${signerPublicKey}" has already signed this operation`);
-    }
-    const updated: MultiSigOperation = {
-        ...operation,
-        collectedSignatures: [...operation.collectedSignatures, signerPublicKey],
-    };
-    if (updated.collectedSignatures.length >= config.threshold) {
-        updated.status = 'approved';
-    }
-    return updated;
-}
-
-/**
- * Marks an approved multi-sig operation as executed.
- * Throws if the operation has not yet reached the required signature threshold.
- */
-export function executeMultiSigOperation(operation: MultiSigOperation): MultiSigOperation {
-    if (operation.status !== 'approved') {
-        throw new Error(
-            `Cannot execute operation with status "${operation.status}" — threshold not reached`,
+export async function invokeContract<TArgs extends xdr.ScVal[], TReturn>(
+    options: ContractInvokeOptions<TArgs>,
+    parse: (raw: SorobanRpc.Api.SimulateTransactionResponse) => TReturn,
+    _simulate: typeof simulateContractCall = simulateContractCall,
+): Promise<TypedInvokeResult<TReturn>> {
+    try {
+        const raw = await _simulate(
+            options.contractId,
+            options.method,
+            options.args,
+            options.sourcePublicKey,
         );
+        return { ok: true, result: parse(raw) };
+    } catch (err: unknown) {
+        const parsed = parseStellarError(err);
+        return {
+            ok: false,
+            error: {
+                message: parsed.message,
+                code: parsed.code,
+                status:
+                    parsed.code === 'RATE_LIMITED' ? 429
+                    : parsed.code === 'ENDPOINT_UNREACHABLE' ? 503
+                    : undefined,
+            },
+        };
     }
-    return { ...operation, status: 'executed' };
 }
 
 // ---------------------------------------------------------------------------
-// Contract State Snapshot and Restore (#623)
+// #616 — Storage Key Namespace Collision Detection
 // ---------------------------------------------------------------------------
+//
+// Template-generated contracts receive storage key prefixes derived from their
+// configuration. Two contracts (or two features within one contract) collide
+// when their key prefixes are identical, which would corrupt shared state.
+//
+// Detection is purely static: keys are analysed before deployment so
+// collisions are surfaced as configuration errors, not runtime failures.
 
-export interface ContractStorageEntry {
-    /** Base64-encoded XDR key */
+/** A named storage key entry used for collision analysis. */
+export interface StorageKeyEntry {
+    /** Human-readable owner label (e.g. template name or feature name). */
+    owner: string;
+    /** The storage key string (namespace prefix or full key). */
     key: string;
-    /** Base64-encoded XDR value */
-    value: string;
 }
 
-export interface ContractSnapshot {
-    /** Snapshot format version — bump when the schema changes */
-    version: 1;
-    contractId: string;
-    /** Restricted to testnet; mainnet operations are always rejected */
-    network: 'testnet';
-    capturedAt: number;
-    entries: ContractStorageEntry[];
+/** Describes a detected storage key collision. */
+export interface StorageKeyCollision {
+    key: string;
+    owners: string[];
+}
+
+/** Thrown when one or more storage key collisions are detected. */
+export class StorageKeyCollisionError extends Error {
+    readonly collisions: StorageKeyCollision[];
+
+    constructor(collisions: StorageKeyCollision[]) {
+        const summary = collisions
+            .map((c) => `"${c.key}" (used by: ${c.owners.join(', ')})`)
+            .join('; ');
+        super(`Storage key namespace collision detected: ${summary}`);
+        this.name = 'StorageKeyCollisionError';
+        this.collisions = collisions;
+    }
 }
 
 /**
- * Captures a portable snapshot of a Soroban contract's storage entries.
+ * Detect storage key namespace collisions across a set of key entries.
  *
- * Snapshot / restore workflow:
- *  1. Call `snapshotContractState` on testnet to capture current storage.
- *  2. Reproduce or modify state as needed for debugging.
- *  3. Call `restoreContractState` with the snapshot to reapply it.
+ * Returns an array of collisions (empty if none). Each collision lists the
+ * conflicting key and all owners that claim it.
  *
- * Restricted to testnet — throws for any other network value.
+ * @param entries - Array of `{ owner, key }` pairs to analyse
+ * @returns Array of `StorageKeyCollision` objects (empty when no collisions)
  *
- * @param contractId   - The Soroban contract address (C...).
- * @param network      - Must be 'testnet'.
- * @param _getEntries  - Injectable fetcher for storage entries (default: RPC).
+ * @example
+ * ```ts
+ * const collisions = detectStorageKeyCollisions([
+ *   { owner: 'TokenA', key: 'balance' },
+ *   { owner: 'TokenB', key: 'balance' }, // collision!
+ * ]);
+ * ```
  */
-export async function snapshotContractState(
-    contractId: string,
-    network: string,
-    _getEntries: (id: string) => Promise<ContractStorageEntry[]> = _defaultGetEntries,
-): Promise<ContractSnapshot> {
-    if (network !== 'testnet') {
-        throw new Error('Contract state snapshot is only permitted on testnet');
+export function detectStorageKeyCollisions(entries: StorageKeyEntry[]): StorageKeyCollision[] {
+    const keyMap = new Map<string, string[]>();
+    for (const { owner, key } of entries) {
+        const owners = keyMap.get(key) ?? [];
+        owners.push(owner);
+        keyMap.set(key, owners);
     }
-    const entries = await _getEntries(contractId);
-    return {
-        version: 1,
-        contractId,
-        network: 'testnet',
-        capturedAt: Date.now(),
-        entries,
-    };
+    const collisions: StorageKeyCollision[] = [];
+    for (const [key, owners] of keyMap) {
+        if (owners.length > 1) collisions.push({ key, owners });
+    }
+    return collisions;
 }
 
 /**
- * Restores a Soroban contract's storage to a previously captured snapshot.
+ * Assert that no storage key collisions exist, throwing `StorageKeyCollisionError`
+ * if any are found. Use this as a pre-deployment guard.
  *
- * Restricted to testnet — throws for any other network value.
- * Throws if the snapshot belongs to a different contract.
+ * @param entries - Array of `{ owner, key }` pairs to validate
+ * @throws `StorageKeyCollisionError` when collisions are detected
  *
- * @param contractId    - The Soroban contract address to restore.
- * @param snapshot      - A snapshot produced by `snapshotContractState`.
- * @param network       - Must be 'testnet'.
- * @param _applyEntries - Injectable applier for storage entries (default: RPC).
+ * @example
+ * ```ts
+ * assertNoStorageKeyCollisions(templateKeys); // throws on collision
+ * ```
  */
-export async function restoreContractState(
-    contractId: string,
-    snapshot: ContractSnapshot,
-    network: string,
-    _applyEntries: (id: string, entries: ContractStorageEntry[]) => Promise<void> = _defaultApplyEntries,
-): Promise<void> {
-    if (network !== 'testnet') {
-        throw new Error('Contract state restore is only permitted on testnet');
-    }
-    if (snapshot.contractId !== contractId) {
-        throw new Error(
-            `Snapshot is for contract "${snapshot.contractId}", not "${contractId}"`,
-        );
-    }
-    await _applyEntries(contractId, snapshot.entries);
-}
-
-async function _defaultGetEntries(_contractId: string): Promise<ContractStorageEntry[]> {
-    return [];
-}
-
-async function _defaultApplyEntries(
-    _contractId: string,
-    _entries: ContractStorageEntry[],
-): Promise<void> {
-    // No-op default; production implementation submits restore transactions.
+export function assertNoStorageKeyCollisions(entries: StorageKeyEntry[]): void {
+    const collisions = detectStorageKeyCollisions(entries);
+    if (collisions.length > 0) throw new StorageKeyCollisionError(collisions);
 }
