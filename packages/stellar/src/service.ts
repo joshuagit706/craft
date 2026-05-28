@@ -1,5 +1,5 @@
 import { Horizon, SorobanRpc, Transaction } from 'stellar-sdk';
-import { getNetworkConfig } from './config';
+import { getNetworkConfig, validateNetworkPassphrase } from './config';
 import { parseStellarError, formatError } from './errors';
 import type { StellarNetworkConfig } from '@craft/types';
 
@@ -69,8 +69,66 @@ export async function getAccountBalance(publicKey: string, network?: Network) {
   }
 }
 
+/**
+ * Batch validate multiple Stellar accounts efficiently.
+ * Reduces network round trips by batching account validation queries.
+ *
+ * @param publicKeys - Array of Stellar account public keys to validate
+ * @param network - Target network (defaults to environment config)
+ * @returns Array of validation results with per-account status
+ *
+ * @example
+ * ```typescript
+ * const results = await batchValidateAccounts([
+ *   'GABC...', 'GDEF...', 'GHIJ...'
+ * ]);
+ * results.forEach(r => {
+ *   if (r.valid) console.log(`${r.publicKey}: exists`);
+ *   else console.log(`${r.publicKey}: ${r.error}`);
+ * });
+ * ```
+ */
+export async function batchValidateAccounts(
+  publicKeys: string[],
+  network?: Network
+): Promise<Array<{
+  publicKey: string;
+  valid: boolean;
+  account?: Horizon.ServerApi.AccountRecord;
+  error?: string;
+}>> {
+  const client = getHorizonClient(network);
+  
+  // Batch requests with Promise.allSettled to handle partial failures
+  const results = await Promise.allSettled(
+    publicKeys.map(pk => client.loadAccount(pk))
+  );
+
+  return results.map((result, index) => {
+    const publicKey = publicKeys[index];
+    
+    if (result.status === 'fulfilled') {
+      return {
+        publicKey,
+        valid: true,
+        account: result.value,
+      };
+    } else {
+      const parsed = parseStellarError(result.reason);
+      return {
+        publicKey,
+        valid: false,
+        error: parsed.message,
+      };
+    }
+  });
+}
+
 export async function submitTransaction(transaction: Transaction, network?: Network) {
   try {
+    // Validate network passphrase before submission
+    validateNetworkPassphrase(transaction.networkPassphrase, network);
+    
     return await getHorizonClient(network).submitTransaction(transaction);
   } catch (error) {
     const parsed = parseStellarError(error, (transaction as any).hash);

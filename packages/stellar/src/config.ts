@@ -33,6 +33,35 @@ export function getNetworkConfig(network?: Network): StellarNetworkConfig {
   };
 }
 
+/**
+ * Validates that a transaction's network passphrase matches the target network.
+ * Prevents cross-network transaction replay attacks.
+ *
+ * @param transactionPassphrase - The passphrase used to sign the transaction
+ * @param targetNetwork - The target network ('mainnet' or 'testnet')
+ * @throws Error if passphrase doesn't match the target network
+ *
+ * @example
+ * ```typescript
+ * validateNetworkPassphrase(transaction.networkPassphrase, 'mainnet');
+ * ```
+ */
+export function validateNetworkPassphrase(
+  transactionPassphrase: string,
+  targetNetwork?: Network
+): void {
+  const net = targetNetwork ?? resolveNetwork();
+  const expectedPassphrase = NETWORK_PASSPHRASES[net];
+
+  if (transactionPassphrase !== expectedPassphrase) {
+    throw new Error(
+      `Network passphrase mismatch: transaction signed for "${transactionPassphrase}" ` +
+      `but target network "${net}" requires "${expectedPassphrase}". ` +
+      `This prevents cross-network transaction replay.`
+    );
+  }
+}
+
 /** Default config resolved from environment variables. */
 export const config = {
   stellar: getNetworkConfig(),

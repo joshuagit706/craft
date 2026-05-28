@@ -179,6 +179,82 @@ export async function simulateContractCall(
 }
 
 /**
+ * Performs a dry-run simulation of a Soroban contract invocation.
+ * Detects errors and estimates resources before actual deployment.
+ *
+ * @param contractId - The contract address (C...)
+ * @param method - The contract method name
+ * @param args - XDR-encoded method arguments
+ * @param sourcePublicKey - The source account public key
+ * @returns Simulation result with success status, errors, and resource estimates
+ *
+ * @example
+ * ```typescript
+ * const dryRun = await performContractDryRun(contractId, 'transfer', args, pubKey);
+ * if (!dryRun.success) {
+ *   console.error('Simulation failed:', dryRun.error);
+ *   return; // Block deployment
+ * }
+ * console.log('Estimated fee:', dryRun.resourceEstimate?.fee);
+ * ```
+ */
+export async function performContractDryRun(
+    contractId: string,
+    method: string,
+    args: xdr.ScVal[],
+    sourcePublicKey: string
+): Promise<{
+    success: boolean;
+    error?: string;
+    resourceEstimate?: {
+        cpuInstructions?: string;
+        memoryBytes?: string;
+        fee?: string;
+    };
+    result?: SorobanRpc.Api.SimulateTransactionResponse;
+}> {
+    try {
+        const simulation = await simulateContractCall(
+            contractId,
+            method,
+            args,
+            sourcePublicKey
+        );
+
+        // Check for simulation errors
+        if (SorobanRpc.Api.isSimulationError(simulation)) {
+            return {
+                success: false,
+                error: `Contract simulation failed: ${simulation.error}`,
+                result: simulation,
+            };
+        }
+
+        // Extract resource estimates if available
+        const resourceEstimate: any = {};
+        if ('cost' in simulation && simulation.cost) {
+            resourceEstimate.cpuInstructions = simulation.cost.cpuInsns;
+            resourceEstimate.memoryBytes = simulation.cost.memBytes;
+        }
+        if ('minResourceFee' in simulation) {
+            resourceEstimate.fee = simulation.minResourceFee;
+        }
+
+        return {
+            success: true,
+            resourceEstimate,
+            result: simulation,
+        };
+    } catch (error: unknown) {
+        const parsed = parseStellarError(error);
+        return {
+            success: false,
+            error: `Dry-run failed: ${parsed.message}`,
+        };
+    }
+}
+
+/**
  * Prepares and submits a contract invocation transaction.
  * Caller is responsible for signing the prepared transaction before submission.
  *
