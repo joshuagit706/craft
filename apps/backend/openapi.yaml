@@ -217,6 +217,94 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+    post:
+      summary: Create a new deployment
+      description: >
+        Creates a new deployment for the authenticated user. Supports idempotent
+        creation via the `Idempotency-Key` header. Sending the same key within
+        24 hours returns the original response without triggering a duplicate
+        deployment. Keys are scoped per user — the same key string from
+        different users creates independent deployments.
+      tags:
+        - Deployments
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+            maxLength: 255
+          description: >
+            Client-generated unique key for idempotent request deduplication.
+            If a successful response for this key was already cached within the
+            24-hour window, that response is returned immediately with the
+            `Idempotent-Replayed: true` header instead of creating a duplicate
+            deployment. Recommended format: UUIDv4.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - templateId
+              properties:
+                templateId:
+                  type: string
+                  description: ID of the template to deploy.
+                name:
+                  type: string
+                  description: Optional display name for the deployment.
+                customizationConfig:
+                  type: object
+                  description: Template-specific customization options.
+      responses:
+        '201':
+          description: Deployment created successfully.
+          headers:
+            Idempotent-Replayed:
+              schema:
+                type: string
+                enum: ['true']
+              description: >
+                Present and set to `true` when the response was served from the
+                idempotency cache rather than creating a new deployment.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Deployment'
+        '400':
+          description: Invalid request body.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Deployment limit reached for the current subscription tier.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Template not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '422':
+          description: Invalid customization config or Stellar endpoints.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
 
   /deployments/{id}/analytics:
     get:

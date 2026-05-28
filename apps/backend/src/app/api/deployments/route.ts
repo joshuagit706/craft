@@ -8,6 +8,7 @@ import {
   validateCustomizationConfig,
   validateStellarEndpoints,
 } from '@/lib/customization/validate';
+import { withIdempotency } from '@/lib/api/idempotency';
 
 type RequestBody = {
   templateId: string;
@@ -213,8 +214,11 @@ export const GET = withAuth(async (req: NextRequest, ctx: any) =>
   deploymentRouter.handle(req, 'GET', ctx),
 );
 
-export const POST = withAuth(async (req: NextRequest, ctx: any) =>
-  deploymentRouter.handle(req, 'POST', ctx),
-);
+export const POST = withAuth(async (req: NextRequest, ctx: any) => {
+  const handler = withIdempotency(ctx.user.id, (r) =>
+    deploymentRouter.handle(r, 'POST', ctx),
+  );
+  return handler(req);
+});
 
 export { deploymentRouter };
