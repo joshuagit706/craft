@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { withCronAuth } from '@/lib/api/cron-auth';
 
 interface SmokeResult {
     name: string;
@@ -30,12 +31,7 @@ async function probe(name: string, path: string, init?: RequestInit): Promise<Sm
  *
  * Protected by CRON_SECRET.  Returns 200 when all checks pass, 503 otherwise.
  */
-export async function GET(req: NextRequest) {
-    const cronSecret = process.env.CRON_SECRET;
-    if (cronSecret && req.headers.get('authorization') !== `Bearer ${cronSecret}`) {
-        return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    }
-
+async function handleSmokeTest(req: NextRequest) {
     const checks = await Promise.all([
         // Auth endpoints responsive
         probe('auth:signup-rejects-invalid', '/api/auth/signup', {
@@ -74,3 +70,5 @@ export async function GET(req: NextRequest) {
 
     return NextResponse.json(body, { status: allPassed ? 200 : 503 });
 }
+
+export const GET = withCronAuth(handleSmokeTest);

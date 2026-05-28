@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@/lib/supabase/server';
+import { withCronAuth } from '@/lib/api/cron-auth';
 
 /**
  * Cron: purge expired GitHub tokens
@@ -13,12 +14,7 @@ import { createClient } from '@/lib/supabase/server';
  * Note: profiles with NULL github_token_expires_at (classic PATs with no
  * known expiry) are intentionally left untouched.
  */
-export async function GET(req: NextRequest) {
-    const cronSecret = process.env.CRON_SECRET;
-    if (cronSecret && req.headers.get('authorization') !== `Bearer ${cronSecret}`) {
-        return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    }
-
+async function handlePurge(req: NextRequest) {
     const supabase = createClient();
 
     const { error, count } = await supabase
@@ -37,3 +33,5 @@ export async function GET(req: NextRequest) {
 
     return NextResponse.json({ purged: count ?? 0 });
 }
+
+export const GET = withCronAuth(handlePurge);

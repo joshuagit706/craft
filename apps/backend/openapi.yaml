@@ -615,6 +615,81 @@ components:
       scheme: bearer
       bearerFormat: JWT
 
+# ── Rate Limiting ──────────────────────────────────────────────────────────────
+
+rateLimiting:
+  description: |
+    API requests are rate-limited based on subscription tier using a sliding-window
+    algorithm. Different limits apply to general endpoints vs. sensitive operations
+    (authentication, payments, deployment creation).
+
+  tierLimits:
+    free:
+      general: "100 requests per minute"
+      sensitive: "10 requests per minute"
+      description: "Free tier users have conservative limits"
+
+    pro:
+      general: "1,000 requests per minute"
+      sensitive: "100 requests per minute"
+      description: "Pro tier users get elevated limits for development"
+
+    enterprise:
+      general: "10,000 requests per minute"
+      sensitive: "1,000 requests per minute"
+      description: "Enterprise tier users get premium limits for production workloads"
+
+  sensitiveEndpoints:
+    - "/api/auth/*"
+    - "/api/payments/*"
+    - "/api/deployments/create"
+
+  headers:
+    X-RateLimit-Limit:
+      description: "Maximum requests allowed in current window"
+      type: integer
+
+    X-RateLimit-Remaining:
+      description: "Requests remaining in current window"
+      type: integer
+
+    X-RateLimit-Reset:
+      description: "Unix timestamp when rate limit window resets"
+      type: integer
+
+    X-RateLimit-Tier:
+      description: "User's subscription tier (free, pro, enterprise)"
+      type: string
+
+    Retry-After:
+      description: "Seconds to wait before retrying (on 429 responses)"
+      type: integer
+
+  responses:
+    "429":
+      description: "Rate limit exceeded"
+      schema:
+        type: object
+        properties:
+          error:
+            type: string
+            example: "Too many requests. Please try again later."
+          retryAfterMs:
+            type: integer
+            description: "Milliseconds to wait before retrying"
+          resetAt:
+            type: integer
+            description: "Unix timestamp when rate limit resets"
+          tier:
+            type: string
+            enum: [free, pro, enterprise]
+
+  slidingWindow:
+    description: |
+      Rate limits use a sliding window algorithm to prevent burst attacks.
+      The window rolls continuously, not fixed intervals. Each request timestamp
+      within the last 60 seconds counts toward the limit.
+
 # ── Webhook Security Requirements ──────────────────────────────────────────────
 
 webhookSecurity:

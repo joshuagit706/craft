@@ -1,6 +1,7 @@
 import { stripe } from '@/lib/stripe/client';
 import { getTierFromPriceId } from '@/lib/stripe/pricing';
 import { createClient } from '@/lib/supabase/server';
+import { paymentIdempotencyService } from './payment-idempotency.service';
 import type {
     CheckoutSession,
     SubscriptionStatus,
@@ -28,7 +29,8 @@ import type {
  */
 export class PaymentService {
     /**
-     * Create a Stripe checkout session for subscription
+     * Create a Stripe checkout session for subscription with idempotency guarantees.
+     * Retried calls with the same user/priceId will return the same session ID.
      */
     async createCheckoutSession(
         userId: string,
@@ -37,6 +39,12 @@ export class PaymentService {
         cancelUrl?: string
     ): Promise<CheckoutSession> {
         const supabase = createClient();
+
+        // Generate idempotency key for this operation
+        const idempotencyKey = await paymentIdempotencyService.generateKey(
+            userId,
+            'checkout_session'
+        );
 
         // Get or create Stripe customer
         const { data: profile } = await supabase
@@ -74,22 +82,34 @@ export class PaymentService {
                 .eq('id', userId);
         }
 
-        // Create checkout session
-        const session = await stripe.checkout.sessions.create({
-            customer: customerId,
-            mode: 'subscription',
-            payment_method_types: ['card'],
-            line_items: [
-                {
-                    price: priceId,
-                    quantity: 1,
+        // Create checkout session with idempotency key
+        const session = await stripe.checkout.sessions.create(
+            {
+                customer: customerId,
+                mode: 'subscription',
+                payment_method_types: ['card'],
+                line_items: [
+                    {
+                        price: priceId,
+                        quantity: 1,
+                    },
+                ],
+                success_url: successUrl ?? `${process.env.NEXT_PUBLIC_APP_URL}/dashboard?session_id={CHECKOUT_SESSION_ID}`,
+                cancel_url: cancelUrl ?? `${process.env.NEXT_PUBLIC_APP_URL}/pricing`,
+                metadata: {
+                    user_id: userId,
                 },
-            ],
-            success_url: successUrl ?? `${process.env.NEXT_PUBLIC_APP_URL}/dashboard?session_id={CHECKOUT_SESSION_ID}`,
-            cancel_url: cancelUrl ?? `${process.env.NEXT_PUBLIC_APP_URL}/pricing`,
-            metadata: {
-                user_id: userId,
             },
+            {
+                idempotencyKey,
+            }
+        );
+
+        // Store the response for future retry scenarios
+        await paymentIdempotencyService.storeResponse(idempotencyKey, {
+            sessionId: session.id,
+            url: session.url,
+            createdAt: new Date().toISOString(),
         });
 
         return {
@@ -135,11 +155,29 @@ export class PaymentService {
     }
 
     /**
-     * Cancel a subscription
+     * Cancel a subscription with idempotency guarantees.
+     * Retried calls with the same subscriptionId will be idempotent.
      */
-    async cancelSubscription(subscriptionId: string): Promise<void> {
-        await stripe.subscriptions.update(subscriptionId, {
-            cancel_at_period_end: true,
+    async cancelSubscription(userId: string, subscriptionId: string): Promise<void> {
+        const idempotencyKey = await paymentIdempotencyService.generateKey(
+            userId,
+            'cancel'
+        );
+
+        const response = await stripe.subscriptions.update(
+            subscriptionId,
+            {
+                cancel_at_period_end: true,
+            },
+            {
+                idempotencyKey,
+            }
+        );
+
+        await paymentIdempotencyService.storeResponse(idempotencyKey, {
+            subscriptionId: response.id,
+            cancelAtPeriodEnd: response.cancel_at_period_end,
+            canceledAt: new Date().toISOString(),
         });
     }
 
