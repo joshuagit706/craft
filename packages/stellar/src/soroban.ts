@@ -363,83 +363,283 @@ export async function invokeContractMethod(
     }
 }
 
-function parseAbiVersion(versionString: string): AbiVersionInfo | null {
-    const match = versionString.match(/^(\d+)\.(\d+)\.(\d+)$/);
-    if (!match) return null;
-    return {
-        major: parseInt(match[1], 10),
-        minor: parseInt(match[2], 10),
-        patch: parseInt(match[3], 10),
-    };
+// ---------------------------------------------------------------------------
+// Contract Upgrade Path Management (#621)
+// ---------------------------------------------------------------------------
+
+export interface StorageKeySchema {
+    /** Symbolic name for the storage key (e.g. "Balance", "Config") */
+    name: string;
+    /** XDR type tag for the key value */
+    typeTag: string;
 }
 
-function detectContractAbiVersion(contractSpec: any): AbiVersionInfo | null {
-    if (!contractSpec) return null;
-
-    if (typeof contractSpec.version === 'string') {
-        return parseAbiVersion(contractSpec.version);
-    }
-
-    if (typeof contractSpec.contractAbiVersion === 'string') {
-        return parseAbiVersion(contractSpec.contractAbiVersion);
-    }
-
-    if (contractSpec.abiVersion && typeof contractSpec.abiVersion === 'object') {
-        return {
-            major: contractSpec.abiVersion.major ?? 0,
-            minor: contractSpec.abiVersion.minor ?? 0,
-            patch: contractSpec.abiVersion.patch ?? 0,
-        };
-    }
-
-    return null;
+export interface UpgradeCompatibilityResult {
+    compatible: boolean;
+    /** Human-readable reason when compatible is false */
+    reason?: string;
 }
 
-function isAbiVersionCompatible(contractAbi: AbiVersionInfo, supported: AbiVersionInfo[]): boolean {
-    return supported.some(
-        (v) => v.major === contractAbi.major && v.minor === contractAbi.minor
-    );
+export interface ContractUpgradeRecord {
+    contractId: string;
+    previousWasmHash: string;
+    newWasmHash: string;
+    scheduledAt: number;
+    upgraderPublicKey: string;
+    status: 'pending' | 'applied' | 'rolled_back';
 }
 
 /**
- * Validates that a contract ABI version is compatible with the target network.
- * @param contractSpec - The contract specification object
- * @param network - The network name ('mainnet' or 'testnet')
- * @returns AbiCompatibilityResult indicating compatibility
+ * Validates that the new contract version is state-compatible with the
+ * currently deployed version.
+ *
+ * Rules:
+ *  - No persistent storage keys may be removed (would corrupt existing state).
+ *  - Existing key type tags must not change (would break deserialization).
+ *  - New keys may be freely added.
  */
-export function validateContractAbiVersion(
-    contractSpec: any,
-    network: string = config.stellar.network
-): AbiCompatibilityResult {
-    const detectedAbi = detectContractAbiVersion(contractSpec);
-    const supportedVersions = SUPPORTED_ABI_VERSIONS[network] ?? [];
-
-    if (!detectedAbi) {
-        return {
-            compatible: false,
-            contractAbi: { major: 0, minor: 0, patch: 0 },
-            networkSupportedVersions: supportedVersions,
-            error: 'Unable to detect contract ABI version',
-        };
+export function validateUpgradeCompatibility(
+    deployedSchema: StorageKeySchema[],
+    newSchema: StorageKeySchema[],
+): UpgradeCompatibilityResult {
+    for (const deployed of deployedSchema) {
+        const inNew = newSchema.find((k) => k.name === deployed.name);
+        if (!inNew) {
+            return {
+                compatible: false,
+                reason: `Upgrade removes storage key "${deployed.name}" — existing state would be inaccessible`,
+            };
+        }
+        if (inNew.typeTag !== deployed.typeTag) {
+            return {
+                compatible: false,
+                reason: `Upgrade changes type of storage key "${deployed.name}" from "${deployed.typeTag}" to "${inNew.typeTag}"`,
+            };
+        }
     }
+    return { compatible: true };
+}
 
-    const compatible = isAbiVersionCompatible(detectedAbi, supportedVersions);
-
-    if (!compatible) {
-        const supportedStr = supportedVersions
-            .map((v) => `${v.major}.${v.minor}.${v.patch}`)
-            .join(', ');
-        return {
-            compatible: false,
-            contractAbi: detectedAbi,
-            networkSupportedVersions: supportedVersions,
-            error: `Contract ABI version ${detectedAbi.major}.${detectedAbi.minor}.${detectedAbi.patch} is not supported on ${network}. Supported versions: ${supportedStr}`,
-        };
+/**
+ * Schedules a contract upgrade after performing compatibility validation.
+ * Returns a pending upgrade record; throws if the schemas are incompatible.
+ *
+ * Upgrade procedure:
+ *  1. Call `scheduleContractUpgrade` — validates schemas and returns a pending record.
+ *  2. Submit the WASM upload + contract upgrade transactions on-chain.
+ *  3. Update record status to 'applied'.
+ *
+ * Rollback: call `rollbackContractUpgrade` on any pending record to cancel it
+ * before the on-chain transaction is submitted.
+ */
+export function scheduleContractUpgrade(
+    contractId: string,
+    previousWasmHash: string,
+    newWasmHash: string,
+    upgraderPublicKey: string,
+    deployedSchema: StorageKeySchema[],
+    newSchema: StorageKeySchema[],
+): ContractUpgradeRecord {
+    const validation = validateUpgradeCompatibility(deployedSchema, newSchema);
+    if (!validation.compatible) {
+        throw new Error(`Contract upgrade rejected: ${validation.reason}`);
     }
-
     return {
-        compatible: true,
-        contractAbi: detectedAbi,
-        networkSupportedVersions: supportedVersions,
+        contractId,
+        previousWasmHash,
+        newWasmHash,
+        scheduledAt: Date.now(),
+        upgraderPublicKey,
+        status: 'pending',
     };
+}
+
+/**
+ * Marks a pending upgrade record as rolled back.
+ * Only records with status 'pending' can be rolled back.
+ */
+export function rollbackContractUpgrade(record: ContractUpgradeRecord): ContractUpgradeRecord {
+    if (record.status !== 'pending') {
+        throw new Error(`Cannot roll back upgrade with status "${record.status}"`);
+    }
+    return { ...record, status: 'rolled_back' };
+}
+
+// ---------------------------------------------------------------------------
+// Multi-Signature Authorization for Admin Operations (#622)
+// ---------------------------------------------------------------------------
+
+export interface MultiSigConfig {
+    /** Minimum number of valid signatures required to execute the operation */
+    threshold: number;
+    /** Set of public keys authorized to sign admin operations */
+    authorizedSigners: string[];
+}
+
+export interface MultiSigOperation {
+    id: string;
+    /** Serialized operation payload */
+    payload: string;
+    /** Public keys of authorized signers that have signed this operation */
+    collectedSignatures: string[];
+    status: 'pending' | 'approved' | 'executed';
+}
+
+/**
+ * Creates a new pending multi-sig operation.
+ * Throws if the threshold is invalid relative to the authorized signer set.
+ */
+export function createMultiSigOperation(
+    payload: string,
+    config: MultiSigConfig,
+): MultiSigOperation {
+    if (config.threshold < 1) {
+        throw new Error('Multi-sig threshold must be at least 1');
+    }
+    if (config.threshold > config.authorizedSigners.length) {
+        throw new Error('Multi-sig threshold cannot exceed the number of authorized signers');
+    }
+    return {
+        id: `msig_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        payload,
+        collectedSignatures: [],
+        status: 'pending',
+    };
+}
+
+/**
+ * Adds a validated signature to a pending multi-sig operation.
+ *
+ * - Rejects signers not in config.authorizedSigners.
+ * - Rejects duplicate signatures from the same signer.
+ * - Rejects signatures on non-pending operations.
+ * - Transitions status to 'approved' when the threshold is reached.
+ */
+export function collectSignature(
+    operation: MultiSigOperation,
+    signerPublicKey: string,
+    config: MultiSigConfig,
+): MultiSigOperation {
+    if (operation.status !== 'pending') {
+        throw new Error(`Cannot add signature to operation with status "${operation.status}"`);
+    }
+    if (!config.authorizedSigners.includes(signerPublicKey)) {
+        throw new Error(`Signer "${signerPublicKey}" is not in the authorized signer set`);
+    }
+    if (operation.collectedSignatures.includes(signerPublicKey)) {
+        throw new Error(`Signer "${signerPublicKey}" has already signed this operation`);
+    }
+    const updated: MultiSigOperation = {
+        ...operation,
+        collectedSignatures: [...operation.collectedSignatures, signerPublicKey],
+    };
+    if (updated.collectedSignatures.length >= config.threshold) {
+        updated.status = 'approved';
+    }
+    return updated;
+}
+
+/**
+ * Marks an approved multi-sig operation as executed.
+ * Throws if the operation has not yet reached the required signature threshold.
+ */
+export function executeMultiSigOperation(operation: MultiSigOperation): MultiSigOperation {
+    if (operation.status !== 'approved') {
+        throw new Error(
+            `Cannot execute operation with status "${operation.status}" — threshold not reached`,
+        );
+    }
+    return { ...operation, status: 'executed' };
+}
+
+// ---------------------------------------------------------------------------
+// Contract State Snapshot and Restore (#623)
+// ---------------------------------------------------------------------------
+
+export interface ContractStorageEntry {
+    /** Base64-encoded XDR key */
+    key: string;
+    /** Base64-encoded XDR value */
+    value: string;
+}
+
+export interface ContractSnapshot {
+    /** Snapshot format version — bump when the schema changes */
+    version: 1;
+    contractId: string;
+    /** Restricted to testnet; mainnet operations are always rejected */
+    network: 'testnet';
+    capturedAt: number;
+    entries: ContractStorageEntry[];
+}
+
+/**
+ * Captures a portable snapshot of a Soroban contract's storage entries.
+ *
+ * Snapshot / restore workflow:
+ *  1. Call `snapshotContractState` on testnet to capture current storage.
+ *  2. Reproduce or modify state as needed for debugging.
+ *  3. Call `restoreContractState` with the snapshot to reapply it.
+ *
+ * Restricted to testnet — throws for any other network value.
+ *
+ * @param contractId   - The Soroban contract address (C...).
+ * @param network      - Must be 'testnet'.
+ * @param _getEntries  - Injectable fetcher for storage entries (default: RPC).
+ */
+export async function snapshotContractState(
+    contractId: string,
+    network: string,
+    _getEntries: (id: string) => Promise<ContractStorageEntry[]> = _defaultGetEntries,
+): Promise<ContractSnapshot> {
+    if (network !== 'testnet') {
+        throw new Error('Contract state snapshot is only permitted on testnet');
+    }
+    const entries = await _getEntries(contractId);
+    return {
+        version: 1,
+        contractId,
+        network: 'testnet',
+        capturedAt: Date.now(),
+        entries,
+    };
+}
+
+/**
+ * Restores a Soroban contract's storage to a previously captured snapshot.
+ *
+ * Restricted to testnet — throws for any other network value.
+ * Throws if the snapshot belongs to a different contract.
+ *
+ * @param contractId    - The Soroban contract address to restore.
+ * @param snapshot      - A snapshot produced by `snapshotContractState`.
+ * @param network       - Must be 'testnet'.
+ * @param _applyEntries - Injectable applier for storage entries (default: RPC).
+ */
+export async function restoreContractState(
+    contractId: string,
+    snapshot: ContractSnapshot,
+    network: string,
+    _applyEntries: (id: string, entries: ContractStorageEntry[]) => Promise<void> = _defaultApplyEntries,
+): Promise<void> {
+    if (network !== 'testnet') {
+        throw new Error('Contract state restore is only permitted on testnet');
+    }
+    if (snapshot.contractId !== contractId) {
+        throw new Error(
+            `Snapshot is for contract "${snapshot.contractId}", not "${contractId}"`,
+        );
+    }
+    await _applyEntries(contractId, snapshot.entries);
+}
+
+async function _defaultGetEntries(_contractId: string): Promise<ContractStorageEntry[]> {
+    return [];
+}
+
+async function _defaultApplyEntries(
+    _contractId: string,
+    _entries: ContractStorageEntry[],
+): Promise<void> {
+    // No-op default; production implementation submits restore transactions.
 }

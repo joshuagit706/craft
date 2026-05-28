@@ -137,3 +137,118 @@ export async function submitTransaction(transaction: Transaction, network?: Netw
     );
   }
 }
+
+// ---------------------------------------------------------------------------
+// Transaction Sequencing with Conflict Resolution (#624)
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns true when the submission error represents a sequence number conflict
+ * (tx_bad_seq / bad_seq Horizon result codes).
+ */
+export function isSequenceConflict(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const msg = error.message.toLowerCase();
+  return (
+    msg.includes('tx_bad_seq') ||
+    msg.includes('bad_seq') ||
+    msg.includes('txbadseq') ||
+    // Horizon response body sometimes surfaces this via extras
+    msg.includes('sequence number')
+  );
+}
+
+/**
+ * Manages per-account sequence numbers in memory and refreshes them from
+ * Horizon when a conflict is detected.
+ *
+ * Usage:
+ *  1. Call `getSequence` to obtain the current sequence number.
+ *  2. Build the transaction using that sequence number.
+ *  3. On successful submission call `increment`.
+ *  4. On sequence conflict call `refresh` then retry.
+ */
+export class SequenceManager {
+  private readonly sequences = new Map<string, number>();
+
+  /** Returns the cached sequence number, fetching it from Horizon on first access. */
+  async getSequence(accountId: string, horizon: Horizon.Server): Promise<number> {
+    if (!this.sequences.has(accountId)) {
+      await this.refresh(accountId, horizon);
+    }
+    return this.sequences.get(accountId)!;
+  }
+
+  /** Increments the cached sequence number after a successful submission. */
+  increment(accountId: string): void {
+    const current = this.sequences.get(accountId) ?? 0;
+    this.sequences.set(accountId, current + 1);
+  }
+
+  /** Fetches the current sequence number from Horizon and updates the cache. */
+  async refresh(accountId: string, horizon: Horizon.Server): Promise<number> {
+    const account = await horizon.loadAccount(accountId);
+    const seq = parseInt((account as any).sequence ?? account.sequenceNumber(), 10);
+    this.sequences.set(accountId, seq);
+    return seq;
+  }
+
+  /** Clears the cached sequence for one account, or all accounts when omitted. */
+  clear(accountId?: string): void {
+    if (accountId !== undefined) {
+      this.sequences.delete(accountId);
+    } else {
+      this.sequences.clear();
+    }
+  }
+}
+
+export const defaultSequenceManager = new SequenceManager();
+
+/**
+ * Submits a transaction built by `buildTransaction`, automatically detecting
+ * sequence number conflicts and retrying with a refreshed sequence.
+ *
+ * Sequencing strategy:
+ *  - On first attempt the cached (or freshly fetched) sequence is used.
+ *  - When a tx_bad_seq conflict is returned, the sequence is refreshed from
+ *    Horizon and the transaction is rebuilt and resubmitted (up to maxRetries).
+ *  - On concurrent submission scenarios the account sequence is re-read each
+ *    retry so the corrected value is always authoritative.
+ *
+ * @param accountId        - Public key of the source account.
+ * @param buildTransaction - Factory called with the current sequence number.
+ * @param network          - Optional network override.
+ * @param _manager         - Optional SequenceManager override (for testing).
+ * @param maxRetries       - Number of conflict-resolution retries (default 1).
+ */
+export async function submitWithSequenceRetry(
+  accountId: string,
+  buildTransaction: (sequenceNumber: number) => Transaction,
+  network?: Network,
+  _manager: SequenceManager = defaultSequenceManager,
+  maxRetries = 1,
+): Promise<Awaited<ReturnType<Horizon.Server['submitTransaction']>>> {
+  const horizon = getHorizonClient(network);
+  let attempt = 0;
+
+  while (true) {
+    const seq = await _manager.getSequence(accountId, horizon);
+    const tx = buildTransaction(seq);
+    try {
+      const result = await horizon.submitTransaction(tx);
+      _manager.increment(accountId);
+      return result;
+    } catch (error) {
+      if (isSequenceConflict(error) && attempt < maxRetries) {
+        attempt++;
+        await _manager.refresh(accountId, horizon);
+        continue;
+      }
+      const parsed = parseStellarError(error, (tx as any).hash?.());
+      throw new Error(
+        `Failed to submit transaction: ${parsed.message}\n${formatError(error, true)}`,
+      );
+    }
+  }
+}
