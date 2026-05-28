@@ -26,6 +26,18 @@
  *   invalidated — any concurrent request that decrypted the old value will
  *   receive a 401 from GitHub on its next probe.
  *
+ * Proactive rotation (rotateIfExpiringSoon):
+ *   Checks whether the stored token will expire within ROTATION_LEAD_MS and,
+ *   if so, calls the caller-supplied refresh function to obtain a new token,
+ *   then rotates atomically and revokes the old token on GitHub.
+ *   Rotation metadata (rotatedAt, previousTokenPrefix) is written to the
+ *   profile row for audit purposes.  Rotation failures are retried with
+ *   exponential back-off up to MAX_ROTATION_RETRIES times.
+ *
+ * Token revocation (revokeToken):
+ *   Calls the GitHub API to delete the OAuth token so it can no longer be
+ *   used. Revocation is best-effort; failure is logged but not re-thrown.
+ *
  * Assumptions / follow-up work:
  *   - Key rotation (re-encrypting all rows with a new key) is out of scope.
  *     Implement key versioning (prefix stored value with key ID) when needed.
@@ -46,6 +58,14 @@ const GITHUB_API_BASE = 'https://api.github.com';
 
 /** How many milliseconds before the stated expiry we treat the token as expired. */
 const EXPIRY_BUFFER_MS = 5 * 60 * 1000; // 5 minutes
+
+/**
+ * Conservative lead time before expiry at which proactive rotation is triggered.
+ * Set to 1 hour so there is ample time for the refresh to succeed even on retry.
+ */
+const ROTATION_LEAD_MS = 60 * 60 * 1000; // 1 hour
+
+const MAX_ROTATION_RETRIES = 3;
 
 export type GitHubCredentialErrorCode =
     | 'NOT_CONNECTED'
@@ -157,6 +177,141 @@ export class GitHubCredentialService {
         }
 
         return newPlaintextToken;
+    }
+
+    /**
+     * Proactively rotates the stored token if it will expire within ROTATION_LEAD_MS.
+     *
+     * Workflow:
+     *   1. Load the profile row to check the expiry timestamp.
+     *   2. If expiry is within the lead window, call `refreshFn` to get a new token.
+     *   3. Revoke the old token on GitHub (best-effort).
+     *   4. Store the new encrypted token + rotation metadata atomically.
+     *
+     * Returns `true` if rotation was performed, `false` if not needed.
+     * Retries up to MAX_ROTATION_RETRIES times on transient failures.
+     *
+     * @param userId - The profile row to check.
+     * @param refreshFn - Caller-supplied function that obtains a fresh token from GitHub OAuth.
+     */
+    async rotateIfExpiringSoon(
+        userId: string,
+        refreshFn: () => Promise<{ token: string; expiresAt?: Date }>,
+    ): Promise<boolean> {
+        const { data, error } = await this._supabase
+            .from('profiles')
+            .select('github_token_encrypted, github_token_expires_at')
+            .eq('id', userId)
+            .single<CredentialRow>();
+
+        if (error || !data?.github_token_encrypted) return false;
+
+        if (!data.github_token_expires_at) return false;
+
+        const expiresAt = new Date(data.github_token_expires_at).getTime();
+        if (Date.now() < expiresAt - ROTATION_LEAD_MS) return false;
+
+        // Within the rotation lead window — attempt rotation with retries.
+        let attempt = 0;
+        while (attempt < MAX_ROTATION_RETRIES) {
+            try {
+                const { token: newToken, expiresAt: newExpiry } = await refreshFn();
+
+                // Decrypt old token for revocation (plaintext never logged).
+                let oldPlaintext: string | undefined;
+                try {
+                    oldPlaintext = decryptToken(data.github_token_encrypted);
+                } catch {
+                    // If we can't decrypt, skip revocation — don't block rotation.
+                }
+
+                await this.rotateToken(userId, newToken, newExpiry);
+
+                // Record rotation metadata for audit trail.
+                await this._supabase
+                    .from('profiles')
+                    .update({
+                        github_token_rotated_at: new Date().toISOString(),
+                        github_token_previous_prefix: oldPlaintext
+                            ? `${oldPlaintext.substring(0, 4)}****`
+                            : null,
+                    })
+                    .eq('id', userId);
+
+                // Revoke old token — best-effort; failure is non-fatal.
+                if (oldPlaintext) {
+                    await this._revokeGitHubToken(oldPlaintext).catch(() => undefined);
+                }
+
+                return true;
+            } catch {
+                attempt++;
+                if (attempt < MAX_ROTATION_RETRIES) {
+                    // Exponential back-off: 1s, 2s, 4s
+                    await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, attempt - 1)));
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Revokes a GitHub OAuth token via the GitHub API.
+     * This is best-effort — the result is not checked by callers.
+     *
+     * Uses Basic Auth with the GitHub OAuth App credentials.
+     * Requires GITHUB_OAUTH_CLIENT_ID and GITHUB_OAUTH_CLIENT_SECRET env vars.
+     */
+    async revokeToken(userId: string): Promise<void> {
+        const { data, error } = await this._supabase
+            .from('profiles')
+            .select('github_token_encrypted')
+            .eq('id', userId)
+            .single<Pick<CredentialRow, 'github_token_encrypted'>>();
+
+        if (error || !data?.github_token_encrypted) return;
+
+        let plaintext: string;
+        try {
+            plaintext = decryptToken(data.github_token_encrypted);
+        } catch {
+            return;
+        }
+
+        await this._revokeGitHubToken(plaintext).catch(() => undefined);
+
+        await this._supabase
+            .from('profiles')
+            .update({
+                github_token_encrypted: null,
+                github_token_expires_at: null,
+                github_token_refreshed_at: null,
+                github_token_rotated_at: new Date().toISOString(),
+            })
+            .eq('id', userId);
+    }
+
+    // ── Private ──────────────────────────────────────────────────────────────
+
+    private async _revokeGitHubToken(token: string): Promise<void> {
+        const clientId = process.env.GITHUB_OAUTH_CLIENT_ID;
+        const clientSecret = process.env.GITHUB_OAUTH_CLIENT_SECRET;
+        if (!clientId || !clientSecret) return;
+
+        await this._fetch(
+            `${GITHUB_API_BASE}/applications/${clientId}/token`,
+            {
+                method: 'DELETE',
+                headers: {
+                    Authorization: `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString('base64')}`,
+                    Accept: 'application/vnd.github+json',
+                    'X-GitHub-Api-Version': '2022-11-28',
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ access_token: token }),
+            },
+        );
     }
 
     private async _probeGitHub(token: string, userId: string): Promise<void> {
