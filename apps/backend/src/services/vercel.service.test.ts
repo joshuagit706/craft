@@ -1366,24 +1366,3 @@ describe('Blue-green alias promotion', () => {
         });
     });
 });
-
-const MOCK_TOKEN = 'test_token';
-
-function makeResponse(
-    status: number,
-    body: unknown,
-    headers: Record<string, string> = {},
-) {
-    return {
-        ok: status >= 200 && status < 300,
-        status,
-        headers: { get: (key: string) => headers[key] ?? null },
-        json: async () => body,
-    };
-}
-
-function makeService() {
-    const mockFetch = vi.fn();
-    const svc = new VercelService(mockFetch as any);
-    return { svc, mockFetch };
-}
