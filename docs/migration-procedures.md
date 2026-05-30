@@ -59,55 +59,33 @@ If any step in the migration workflow fails:
 
 ---
 
-## Soroban Contract Migration: Testnet → Mainnet (#617)
+## Database Backup and Point-in-Time Recovery
 
-Promoting a Soroban contract from testnet to mainnet is a **high-risk, irreversible operation**. The procedure below enforces safety checks at every step.
+CRAFT uses Supabase PITR to ensure any failed migration can be fully reversed without data loss.
 
-### Overview
+### Before Running a Schema Migration
 
-The `migrateSorobanContract` function in `packages/stellar/src/soroban-migration.ts` implements this flow:
+1. Note the current time (UTC) — this is your restore target if the migration fails.
+2. Verify PITR is enabled: Supabase Dashboard → **Project Settings → Database → Backups**.
+3. Confirm the WAL archiving lag is < 1 minute before starting.
 
-1. **Validate config** – reject any testnet-only parameters before touching mainnet.
-2. **Require explicit confirmation** – the caller must pass `{ confirm: true }` to proceed.
-3. **Verify network passphrase** – the transaction must be signed for the mainnet passphrase.
-4. **Deploy to mainnet** – only after all checks pass.
+### Recovery Point After a Failed Migration
 
-### Testnet-Only Parameters (Rejected on Mainnet)
+If a schema migration corrupts data or breaks the application:
 
-The following configuration values are rejected when the target network is `mainnet`:
+1. Follow the full recovery procedure in **[docs/backup-recovery-runbook.md](./backup-recovery-runbook.md)**.
+2. Restore to the timestamp noted in step 1 above (before the migration ran).
+3. Re-apply only the migrations that were known-good before the failure.
 
-| Parameter | Testnet value | Reason |
-|---|---|---|
-| `networkPassphrase` | `Test SDF Network ; September 2015` | Wrong network |
-| `horizonUrl` | `https://horizon-testnet.stellar.org` | Wrong endpoint |
-| `sorobanRpcUrl` | `https://soroban-testnet.stellar.org` | Wrong endpoint |
+### Idempotency Requirement
 
-### Usage
+All Supabase migration files under `supabase/migrations/` must use `IF NOT EXISTS` / `IF EXISTS` guards so that replaying migrations up to any PITR restore point is safe.  The automated tests in `supabase/tests/backup/recovery.test.ts` enforce this property.
 
-```typescript
-import { migrateSorobanContract } from '@craft/stellar';
+### Recovery Time and Point Objectives
 
-const result = await migrateSorobanContract({
-  wasmBinary,
-  sourcePublicKey,
-  config: {
-    network: 'mainnet',
-    horizonUrl: 'https://horizon.stellar.org',
-    networkPassphrase: Networks.PUBLIC,
-    sorobanRpcUrl: 'https://soroban-mainnet.stellar.org',
-  },
-  confirm: true, // explicit opt-in required
-});
-
-if (!result.ok) {
-  console.error('Migration rejected:', result.error);
-}
-```
-
-### Safety Rules
-
-- **Never** reuse a testnet keypair on mainnet without rotating secrets.
-- **Always** run a dry-run simulation on testnet before promoting.
-- **Verify** the contract WASM hash matches the audited binary before mainnet deployment.
-- Mainnet promotion requires `confirm: true`; omitting it returns an error without touching the network.
-
+| Metric | Target |
+|---|---|
+| Recovery Time Objective (RTO) | < 30 minutes |
+| Recovery Point Objective (RPO) | < 1 minute (WAL granularity) |
+| PITR retention (Pro) | 7 days |
+| PITR retention (Enterprise) | 30 days |
