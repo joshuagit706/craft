@@ -22,6 +22,15 @@
  *   - Partial code push → deployment marked failed; the repo may be empty
  *     or partial — the UI should prompt a retry.
  *
+ * GitHub Commit Status Reporting:
+ *   After the commit SHA is known (post-push), GitHub commit statuses are
+ *   posted at each terminal transition:
+ *     pending  → pipeline started
+ *     success  → deployment completed
+ *     failure  → any stage failed
+ *   Status-reporting failures are silently caught and logged — they NEVER
+ *   block or abort the deployment pipeline.
+ *
  * Design doc properties satisfied:
  *   Property 20 — Deployment Pipeline Sequence (generation → repo → push → vercel → URL)
  *   Property 21 — Vercel Environment Variable Configuration
@@ -35,6 +44,9 @@
  *
  * Issue: #114
  * Branch: issue-114-add-structured-logging-with-correlation-ids
+ *
+ * Issue: #651
+ * Branch: feat/issue-115-github-commit-status-reporting
  */
 
 import { createClient } from '@/lib/supabase/server';
@@ -106,7 +118,7 @@ export class DeploymentPipelineService {
         private readonly _syntaxValidator: Pick<SyntaxValidator, 'validate'> = syntaxValidator,
         private readonly _artifactSigningService: ArtifactSigningService = artifactSigningService,
         private readonly _deploymentUpdateService: Pick<DeploymentUpdateService, 'rollbackUpdate'> | null = null,
-        private readonly _buildCacheService: Pick<BuildCacheService, 'checkCache' | 'storeHash'> = buildCacheService,
+        private readonly _commitStatusService: Pick<GitHubCommitStatusService, 'reportPending' | 'reportSuccess' | 'reportFailure'> = githubCommitStatusService,
     ) {}
 
     /**
@@ -336,6 +348,8 @@ export class DeploymentPipelineService {
         const githubToken = process.env.GITHUB_TOKEN ?? '';
         const [owner, repo] = repoFullName.split('/');
 
+        let commitSha: string | undefined;
+
         try {
             const commitRef = await this._githubPushService.pushGeneratedCode({
                 owner,
@@ -348,12 +362,23 @@ export class DeploymentPipelineService {
                 authorEmail: 'craft@stellercraft.io',
             });
 
+            commitSha = commitRef.commitSha;
+
             await this.log(
                 deploymentId,
                 'pushing_code',
                 `Pushed ${commitRef.fileCount} files — commit ${commitRef.commitSha.slice(0, 7)}`,
                 'info',
                 { correlationId, commitSha: commitRef.commitSha, fileCount: commitRef.fileCount },
+            );
+
+            // ── Post "pending" commit status now that we have a commit SHA ──────
+            // Non-fatal: any error is caught and logged but does not block the pipeline.
+            await this.reportCommitStatus(
+                () => this._commitStatusService.reportPending(owner, repo, commitSha!, deploymentId, 'Deployment'),
+                deploymentId,
+                correlationId,
+                'pending',
             );
         } catch (err: unknown) {
             const msg = err instanceof Error ? err.message : 'Unknown push error';
@@ -477,6 +502,16 @@ export class DeploymentPipelineService {
             { correlationId, deploymentUrl },
         );
 
+        // ── Post "success" commit status ──────────────────────────────────────
+        if (commitSha) {
+            await this.reportCommitStatus(
+                () => this._commitStatusService.reportSuccess(owner, repo, commitSha!, deploymentId, deploymentUrl),
+                deploymentId,
+                correlationId,
+                'success',
+            );
+        }
+
         logger.info('Deployment pipeline completed', { deploymentId, deploymentUrl });
 
         return {
@@ -525,6 +560,7 @@ export class DeploymentPipelineService {
         errorMessage: string,
         metadata?: Record<string, unknown>,
         updateContext?: { updateId: string; deploymentId: string },
+        commitContext?: { owner: string; repo: string; sha: string },
     ): Promise<DeploymentPipelineResult> {
         const supabase = createClient();
 
@@ -549,7 +585,22 @@ export class DeploymentPipelineService {
             );
         }
 
+        // ── Post "failure" commit status (best-effort) ────────────────────────
         const correlationId = (metadata?.correlationId as string | undefined) ?? '';
+        if (commitContext) {
+            await this.reportCommitStatus(
+                () => this._commitStatusService.reportFailure(
+                    commitContext.owner,
+                    commitContext.repo,
+                    commitContext.sha,
+                    deploymentId,
+                    stage,
+                ),
+                deploymentId,
+                correlationId,
+                'failure',
+            );
+        }
 
         return {
             success: false,
@@ -558,6 +609,39 @@ export class DeploymentPipelineService {
             errorMessage,
             failedStage: stage,
         };
+    }
+
+    /**
+     * Calls `fn` and swallows any error, logging a warning instead.
+     * This ensures commit status reporting failures never block the pipeline.
+     */
+    private async reportCommitStatus(
+        fn: () => Promise<{ success: boolean; error?: string }>,
+        deploymentId: string,
+        correlationId: string,
+        label: string,
+    ): Promise<void> {
+        try {
+            const result = await fn();
+            if (!result.success) {
+                await this.log(
+                    deploymentId,
+                    'commit_status',
+                    `GitHub commit status (${label}) not posted: ${result.error ?? 'unknown error'}`,
+                    'warn',
+                    { correlationId },
+                );
+            }
+        } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : 'Unknown error';
+            await this.log(
+                deploymentId,
+                'commit_status',
+                `GitHub commit status reporting threw unexpectedly (${label}): ${msg}`,
+                'warn',
+                { correlationId },
+            );
+        }
     }
 
     /**
@@ -590,4 +674,5 @@ export const deploymentPipelineService = new DeploymentPipelineService(
     syntaxValidator,
     artifactSigningService,
     deploymentUpdateService,
+    githubCommitStatusService,
 );
