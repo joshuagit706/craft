@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { verifyGitHubWebhookSignature } from '@/lib/github/webhook-verification';
 import { createLogger, resolveCorrelationId, CORRELATION_ID_HEADER } from '@/lib/api/logger';
 import { webhookDLQ } from '@/lib/webhook-dlq/dead-letter-queue';
+import { webhookDeliveryService } from '@/services/webhook-delivery.service';
 
 const SUPPORTED_EVENTS = new Set([
     'push',
@@ -87,6 +88,35 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ error: 'Missing x-github-event header' }, { status: 400 });
     }
 
+    // 7. Idempotency check using persistent delivery tracking
+    if (deliveryId) {
+        const checkResult = await webhookDeliveryService.hasReceivedDelivery(deliveryId);
+        if (checkResult.received) {
+            log.info('Duplicate delivery detected (already processed)', { deliveryId });
+            const res = NextResponse.json({ received: true, duplicate: true });
+            res.headers.set(CORRELATION_ID_HEADER, correlationId);
+            return res;
+        }
+    }
+
+    // 8. Record delivery for idempotency and replay
+    if (deliveryId) {
+        const recordResult = await webhookDeliveryService.recordDelivery({
+            deliveryId,
+            eventType,
+            payload: payload as Record<string, unknown>,
+            headers: Object.fromEntries(req.headers.entries()),
+        });
+
+        if (!recordResult.success && !recordResult.alreadyExists) {
+            log.error('Failed to record delivery', undefined, {
+                error: recordResult.error,
+                deliveryId,
+            });
+            // Continue processing even if recording fails (best effort)
+        }
+    }
+
     if (!SUPPORTED_EVENTS.has(eventType)) {
         log.info('Unsupported event type acknowledged', { eventType });
         const res = NextResponse.json({ received: true, processed: false });
@@ -94,6 +124,8 @@ export async function POST(req: NextRequest) {
         return res;
     }
 
+    // 9. Process the webhook event
+    let lastError: Error | undefined;
     try {
         if (eventType === 'push') {
             await handlePushEvent(payload, log);
@@ -104,13 +136,35 @@ export async function POST(req: NextRequest) {
         } else if (eventType === 'installation_repositories') {
             await handleInstallationRepositoriesEvent(payload, log);
         }
-    }
 
-    webhookDLQ.capture('github', eventType, body, lastError?.message ?? 'Unknown error', MAX_ATTEMPTS);
-    // Return 200 so GitHub stops retrying — the event is safely in the DLQ.
-    const res = NextResponse.json({ received: true, processed: false, dlq: true });
-    res.headers.set(CORRELATION_ID_HEADER, correlationId);
-    return res;
+        // Mark delivery as processed
+        if (deliveryId) {
+            await webhookDeliveryService.markProcessed(deliveryId);
+        }
+
+        const res = NextResponse.json({ received: true, processed: true });
+        res.headers.set(CORRELATION_ID_HEADER, correlationId);
+        return res;
+    } catch (err: any) {
+        lastError = err;
+        log.error('Webhook processing failed', err, { eventType, deliveryId });
+
+        // Mark delivery as failed
+        if (deliveryId) {
+            await webhookDeliveryService.markFailed(
+                deliveryId,
+                err.message || 'Unknown error'
+            );
+        }
+
+        // Capture in DLQ for manual retry
+        webhookDLQ.capture('github', eventType, body, lastError?.message ?? 'Unknown error', MAX_ATTEMPTS);
+
+        // Return 200 so GitHub stops retrying — the event is safely in the DLQ.
+        const res = NextResponse.json({ received: true, processed: false, dlq: true });
+        res.headers.set(CORRELATION_ID_HEADER, correlationId);
+        return res;
+    }
 }
 
 /**
