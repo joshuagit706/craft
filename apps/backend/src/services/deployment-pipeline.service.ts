@@ -52,7 +52,7 @@ import type { TemplateFamilyId } from './code-generator.service';
 import { syntaxValidator, type SyntaxValidator } from './syntax-validator';
 import { artifactSigningService, ArtifactSigningService } from './artifact-signing.service';
 import { deploymentUpdateService, DeploymentUpdateService } from './deployment-update.service';
-
+import { buildCacheService, BuildCacheService } from './build-cache.service';
 // ── Request / result types ────────────────────────────────────────────────────
 
 export interface DeploymentPipelineRequest {
@@ -106,6 +106,7 @@ export class DeploymentPipelineService {
         private readonly _syntaxValidator: Pick<SyntaxValidator, 'validate'> = syntaxValidator,
         private readonly _artifactSigningService: ArtifactSigningService = artifactSigningService,
         private readonly _deploymentUpdateService: Pick<DeploymentUpdateService, 'rollbackUpdate'> | null = null,
+        private readonly _buildCacheService: Pick<BuildCacheService, 'checkCache' | 'storeHash'> = buildCacheService,
     ) {}
 
     /**
@@ -230,6 +231,20 @@ export class DeploymentPipelineService {
             `Syntax validation passed for ${generationResult.generatedFiles.length} files`,
             'info',
             { correlationId, fileCount: generationResult.generatedFiles.length },
+        );
+
+        // ── Step 2d: Build cache check ────────────────────────────────────────
+        const cacheResult = await this._buildCacheService.checkCache(
+            supabase,
+            deploymentId,
+            generationResult.generatedFiles,
+        );
+        await this.log(
+            deploymentId,
+            'validating',
+            `Build cache ${cacheResult.status}: hash=${cacheResult.contentHash.slice(0, 12)}`,
+            'info',
+            { correlationId, cacheStatus: cacheResult.status, contentHash: cacheResult.contentHash },
         );
 
         // ── Step 2c: Sign artifact ─────────────────────────────────────────────
@@ -450,6 +465,9 @@ export class DeploymentPipelineService {
                 updated_at: new Date().toISOString(),
             })
             .eq('id', deploymentId);
+
+        // Store the content hash so future deployments can detect cache hits
+        await this._buildCacheService.storeHash(supabase, deploymentId, cacheResult.contentHash);
 
         await this.log(
             deploymentId,
