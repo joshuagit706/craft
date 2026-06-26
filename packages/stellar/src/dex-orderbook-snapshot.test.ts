@@ -13,8 +13,11 @@ import {
     computeDexPrice,
     computeVwap,
     assertPriceClose,
+    verifyOrderBookConsistency,
     PRICE_TOLERANCE,
+    CONSISTENCY_TOLERANCE_PERCENT,
     type OrderBookSnapshot,
+    type SnapshotWithMeta,
 } from './dex-price-feed';
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -241,6 +244,97 @@ describe('PRICE_TOLERANCE', () => {
     it('is defined and small', () => {
         expect(PRICE_TOLERANCE).toBeGreaterThan(0);
         expect(PRICE_TOLERANCE).toBeLessThan(1e-5);
+    });
+});
+
+// ── Multi-endpoint consistency verification (#781) ────────────────────────────
+
+/** A slightly shifted copy of DEEP_BOOK: mid-price ≈ 0.505 (< 1% from 0.5). */
+const NEAR_DEEP_BOOK: OrderBookSnapshot = {
+    bids: [{ price: '0.5048000', amount: '5000.0000000', price_r: { n: 5048, d: 10000 } }],
+    asks: [{ price: '0.5052000', amount: '5000.0000000', price_r: { n: 5052, d: 10000 } }],
+};
+
+describe('verifyOrderBookConsistency (#781)', () => {
+    it('is consistent when divergence is within 1% tolerance', () => {
+        // DEEP_BOOK midPrice ≈ 0.5000, NEAR_DEEP_BOOK midPrice = 0.505
+        // divergence ≈ 0.995% < 1%
+        const primary: SnapshotWithMeta = { snapshot: DEEP_BOOK, ledgerSequence: 100 };
+        const secondary: SnapshotWithMeta = { snapshot: NEAR_DEEP_BOOK, ledgerSequence: 100 };
+
+        const result = verifyOrderBookConsistency(primary, secondary);
+        expect(result.consistent).toBe(true);
+        expect(result.divergencePercent).toBeDefined();
+        expect(result.divergencePercent!).toBeLessThanOrEqual(CONSISTENCY_TOLERANCE_PERCENT);
+        expect(result.selectedSnapshot).toBe(primary.snapshot);
+    });
+
+    it('is inconsistent when divergence exceeds 1% tolerance', () => {
+        // THIN_BOOK midPrice = 0.5, SYMMETRIC_BOOK midPrice = 1.0  →  divergence ≈ 66.7%
+        const primary: SnapshotWithMeta = { snapshot: THIN_BOOK, ledgerSequence: 100 };
+        const secondary: SnapshotWithMeta = { snapshot: SYMMETRIC_BOOK, ledgerSequence: 100 };
+
+        const result = verifyOrderBookConsistency(primary, secondary);
+        expect(result.consistent).toBe(false);
+        expect(result.divergencePercent).toBeDefined();
+        expect(result.divergencePercent!).toBeGreaterThan(CONSISTENCY_TOLERANCE_PERCENT);
+    });
+
+    it('calls onViolation with a description when divergence exceeds tolerance', () => {
+        const primary: SnapshotWithMeta = { snapshot: THIN_BOOK, ledgerSequence: 100 };
+        const secondary: SnapshotWithMeta = { snapshot: SYMMETRIC_BOOK, ledgerSequence: 100 };
+
+        const violations: string[] = [];
+        verifyOrderBookConsistency(primary, secondary, msg => violations.push(msg));
+
+        expect(violations).toHaveLength(1);
+        expect(violations[0]).toContain('divergence');
+    });
+
+    it('selects the secondary snapshot when secondary has a higher ledger sequence', () => {
+        const primary: SnapshotWithMeta = { snapshot: THIN_BOOK, ledgerSequence: 100 };
+        const secondary: SnapshotWithMeta = { snapshot: SYMMETRIC_BOOK, ledgerSequence: 200 };
+
+        const result = verifyOrderBookConsistency(primary, secondary);
+        expect(result.consistent).toBe(false);
+        expect(result.selectedSnapshot).toBe(secondary.snapshot);
+    });
+
+    it('selects the primary snapshot when primary has a higher ledger sequence', () => {
+        const primary: SnapshotWithMeta = { snapshot: THIN_BOOK, ledgerSequence: 200 };
+        const secondary: SnapshotWithMeta = { snapshot: SYMMETRIC_BOOK, ledgerSequence: 100 };
+
+        const result = verifyOrderBookConsistency(primary, secondary);
+        expect(result.consistent).toBe(false);
+        expect(result.selectedSnapshot).toBe(primary.snapshot);
+    });
+
+    it('selects the primary snapshot when both snapshots have equal ledger sequence', () => {
+        const primary: SnapshotWithMeta = { snapshot: THIN_BOOK, ledgerSequence: 150 };
+        const secondary: SnapshotWithMeta = { snapshot: SYMMETRIC_BOOK, ledgerSequence: 150 };
+
+        const result = verifyOrderBookConsistency(primary, secondary);
+        expect(result.consistent).toBe(false);
+        expect(result.selectedSnapshot).toBe(primary.snapshot);
+    });
+
+    it('is consistent and selects primary when either book is empty', () => {
+        const primary: SnapshotWithMeta = { snapshot: EMPTY_BOOK, ledgerSequence: 100 };
+        const secondary: SnapshotWithMeta = { snapshot: THIN_BOOK, ledgerSequence: 200 };
+
+        const result = verifyOrderBookConsistency(primary, secondary);
+        expect(result.consistent).toBe(true);
+        expect(result.selectedSnapshot).toBe(primary.snapshot);
+    });
+
+    it('does not call onViolation when snapshots are within tolerance', () => {
+        const primary: SnapshotWithMeta = { snapshot: DEEP_BOOK, ledgerSequence: 100 };
+        const secondary: SnapshotWithMeta = { snapshot: NEAR_DEEP_BOOK, ledgerSequence: 100 };
+
+        const violations: string[] = [];
+        verifyOrderBookConsistency(primary, secondary, msg => violations.push(msg));
+
+        expect(violations).toHaveLength(0);
     });
 });
 

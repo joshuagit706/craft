@@ -152,6 +152,97 @@ export function assertPriceClose(actual: number, expected: number, tolerance = P
     }
 }
 
+// ── Multi-endpoint consistency verification (#781) ────────────────────────────
+
+/** Maximum relative price divergence (%) allowed between two Horizon endpoints. */
+export const CONSISTENCY_TOLERANCE_PERCENT = 1.0;
+
+export interface SnapshotWithMeta {
+    /** The order book snapshot from this endpoint. */
+    snapshot: OrderBookSnapshot;
+    /** Ledger sequence number at the time the snapshot was taken. */
+    ledgerSequence: number;
+}
+
+export interface ConsistencyResult {
+    /** true when the two endpoints agree within {@link CONSISTENCY_TOLERANCE_PERCENT}. */
+    consistent: boolean;
+    /** Percentage divergence between mid-prices; undefined when a mid-price cannot be computed. */
+    divergencePercent: number | undefined;
+    /** The snapshot to use: primary when consistent or when primary is more recent; otherwise secondary. */
+    selectedSnapshot: OrderBookSnapshot;
+    /** Human-readable explanation of why this snapshot was selected. */
+    reason: string;
+}
+
+/**
+ * Compare two order book snapshots from different Horizon endpoints and detect
+ * stale data caused by network splits.
+ *
+ * Algorithm:
+ * 1. Compute mid-price for each snapshot.
+ * 2. Calculate relative divergence = |p1 − p2| / avg(p1, p2) × 100.
+ * 3. If divergence ≤ {@link CONSISTENCY_TOLERANCE_PERCENT} (1%), return primary.
+ * 4. Otherwise log a violation via `onViolation` and return the snapshot with
+ *    the higher ledger sequence (more recent data wins).
+ *
+ * @param primary - Snapshot from the primary Horizon endpoint.
+ * @param secondary - Snapshot from the secondary Horizon endpoint.
+ * @param onViolation - Optional callback invoked with a description when
+ *   divergence exceeds the tolerance (use for analytics / logging).
+ */
+export function verifyOrderBookConsistency(
+    primary: SnapshotWithMeta,
+    secondary: SnapshotWithMeta,
+    onViolation?: (message: string) => void,
+): ConsistencyResult {
+    const primaryPrice = computeDexPrice(primary.snapshot);
+    const secondaryPrice = computeDexPrice(secondary.snapshot);
+
+    if (
+        primaryPrice.midPrice === undefined ||
+        secondaryPrice.midPrice === undefined
+    ) {
+        return {
+            consistent: true,
+            divergencePercent: undefined,
+            selectedSnapshot: primary.snapshot,
+            reason: 'Cannot compute mid-price for one or both endpoints; defaulting to primary',
+        };
+    }
+
+    const avg = (primaryPrice.midPrice + secondaryPrice.midPrice) / 2;
+    const divergencePercent =
+        avg > 0
+            ? (Math.abs(primaryPrice.midPrice - secondaryPrice.midPrice) / avg) * 100
+            : 0;
+
+    if (divergencePercent <= CONSISTENCY_TOLERANCE_PERCENT) {
+        return {
+            consistent: true,
+            divergencePercent,
+            selectedSnapshot: primary.snapshot,
+            reason: 'Endpoints within tolerance; using primary snapshot',
+        };
+    }
+
+    const msg =
+        `Order book consistency violation: ${divergencePercent.toFixed(4)}% divergence ` +
+        `exceeds ${CONSISTENCY_TOLERANCE_PERCENT}% tolerance ` +
+        `(primary ledger ${primary.ledgerSequence}, secondary ledger ${secondary.ledgerSequence})`;
+    onViolation?.(msg);
+
+    const useSecondary = secondary.ledgerSequence > primary.ledgerSequence;
+    return {
+        consistent: false,
+        divergencePercent,
+        selectedSnapshot: useSecondary ? secondary.snapshot : primary.snapshot,
+        reason: useSecondary
+            ? `Selected secondary (ledger ${secondary.ledgerSequence} > ${primary.ledgerSequence})`
+            : `Selected primary (ledger ${primary.ledgerSequence} >= ${secondary.ledgerSequence})`,
+    };
+}
+
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 function topPrice(levels: OrderBookLevel[]): number | undefined {
