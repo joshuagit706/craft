@@ -20,6 +20,12 @@ export const MAX_SUBSCRIPTIONS_PER_CLIENT = 10;
 /** Polling interval in milliseconds. */
 const POLL_INTERVAL_MS = 5_000;
 
+/** Seconds before an unACKed event is re-delivered. */
+export const ACK_TIMEOUT_MS = 30_000;
+
+/** Maximum delivery attempts before an event is moved to the dead-letter buffer. */
+export const MAX_DELIVERY_ATTEMPTS = 5;
+
 export interface SubscriptionFilter {
     /** Contract address (C...) to subscribe to. */
     contractId: string;
@@ -28,11 +34,19 @@ export interface SubscriptionFilter {
 }
 
 export interface SorobanEvent {
+    /** Unique ID for this delivery; pass to {@link SorobanEventRelay.acknowledgeEvent}. */
+    eventId: string;
     contractId: string;
     type: string;
     ledger: number;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     value: any;
+}
+
+interface StagedEvent {
+    event: SorobanEvent;
+    attempts: number;
+    timer: ReturnType<typeof setTimeout>;
 }
 
 /** Minimal WebSocket interface — compatible with the browser/Node ws API. */
@@ -64,12 +78,20 @@ interface Subscription {
  */
 export class SorobanEventRelay {
     private readonly subscriptions = new Map<string, Subscription>();
+    private readonly stagingBuffer = new Map<string, StagedEvent>();
+    private readonly _deadLetterBuffer: SorobanEvent[] = [];
+    private eventCounter = 0;
 
     constructor(
         private readonly ws: WebSocketLike,
         private readonly client: Pick<SorobanRpc.Server, 'getEvents' | 'getLatestLedger'>,
     ) {
         ws.on('close', () => this.cleanup());
+    }
+
+    /** Events that exceeded {@link MAX_DELIVERY_ATTEMPTS} without an ACK. */
+    get deadLetterBuffer(): readonly SorobanEvent[] {
+        return this._deadLetterBuffer;
     }
 
     /**
@@ -114,12 +136,30 @@ export class SorobanEventRelay {
         return this.subscriptions.size;
     }
 
+    /**
+     * Acknowledge receipt of an event.
+     * Clears the re-delivery timer so the event is not re-sent.
+     * Unrecognised IDs are silently ignored (idempotent).
+     */
+    acknowledgeEvent(eventId: string): void {
+        const staged = this.stagingBuffer.get(eventId);
+        if (staged) {
+            clearTimeout(staged.timer);
+            this.stagingBuffer.delete(eventId);
+        }
+    }
+
     /** Clean up all subscriptions (called on WebSocket close). */
     cleanup(): void {
         for (const sub of this.subscriptions.values()) {
             clearInterval(sub.timer);
         }
         this.subscriptions.clear();
+
+        for (const staged of this.stagingBuffer.values()) {
+            clearTimeout(staged.timer);
+        }
+        this.stagingBuffer.clear();
     }
 
     // -------------------------------------------------------------------------
@@ -149,27 +189,53 @@ export class SorobanEventRelay {
                 sub.lastLedger = response.latestLedger;
             }
 
-            for (const event of response.events) {
+            for (const rpcEvent of response.events) {
                 // Server-side filter by event type when specified.
                 if (sub.filter.eventType) {
-                    const typeTopic = event.topic?.[0]?.value?.();
+                    const typeTopic = rpcEvent.topic?.[0]?.value?.();
                     if (typeTopic !== sub.filter.eventType) continue;
                 }
 
                 if (this.ws.readyState !== WS_OPEN) break;
 
+                const eventId = `${rpcEvent.contractId}:${rpcEvent.ledger}:${this.eventCounter++}`;
                 const payload: SorobanEvent = {
-                    contractId: event.contractId,
+                    eventId,
+                    contractId: rpcEvent.contractId,
                     type: sub.filter.eventType ?? 'contract',
-                    ledger: event.ledger,
-                    value: event.value,
+                    ledger: rpcEvent.ledger,
+                    value: rpcEvent.value,
                 };
 
-                this.ws.send(JSON.stringify(payload));
+                this.deliverWithAck(eventId, payload, 1);
             }
         } catch {
             // Polling errors are non-fatal; the next interval will retry.
         }
+    }
+
+    /**
+     * Send an event to the subscriber and set an ACK timer.
+     * If the subscriber does not call {@link acknowledgeEvent} within
+     * {@link ACK_TIMEOUT_MS}, the event is re-delivered (up to
+     * {@link MAX_DELIVERY_ATTEMPTS} total attempts) before being moved to the
+     * dead-letter buffer.
+     */
+    private deliverWithAck(eventId: string, event: SorobanEvent, attempts: number): void {
+        if (this.ws.readyState !== WS_OPEN) return;
+
+        this.ws.send(JSON.stringify(event));
+
+        const timer = setTimeout(() => {
+            this.stagingBuffer.delete(eventId);
+            if (attempts < MAX_DELIVERY_ATTEMPTS) {
+                this.deliverWithAck(eventId, event, attempts + 1);
+            } else {
+                this._deadLetterBuffer.push(event);
+            }
+        }, ACK_TIMEOUT_MS);
+
+        this.stagingBuffer.set(eventId, { event, attempts, timer });
     }
 }
 

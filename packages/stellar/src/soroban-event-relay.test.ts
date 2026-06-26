@@ -5,8 +5,14 @@
  * disconnect, and per-subscriber filtering.
  */
 
-import { describe, it, expect, vi } from 'vitest';
-import { SorobanEventRelay, MAX_SUBSCRIPTIONS_PER_CLIENT } from './soroban-event-relay';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import {
+    SorobanEventRelay,
+    MAX_SUBSCRIPTIONS_PER_CLIENT,
+    ACK_TIMEOUT_MS,
+    MAX_DELIVERY_ATTEMPTS,
+    type SorobanEvent,
+} from './soroban-event-relay';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -144,6 +150,113 @@ describe('SorobanEventRelay – event delivery', () => {
         await new Promise((r) => setTimeout(r, 0));
 
         expect(ws.send).not.toHaveBeenCalled();
+    });
+});
+
+describe('SorobanEventRelay – guaranteed delivery (#780)', () => {
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+
+    it('includes an eventId in the delivered payload', async () => {
+        const ws = makeMockWs();
+        const events = [makeMockEvent(CONTRACT_A, 'transfer', 101)];
+        const client = makeMockClient(events, 101);
+        const relay = new SorobanEventRelay(ws, client);
+
+        relay.subscribe({ contractId: CONTRACT_A });
+        await new Promise(r => setTimeout(r, 0));
+
+        expect(ws.send).toHaveBeenCalledOnce();
+        const sent = JSON.parse(ws.send.mock.calls[0][0]) as SorobanEvent;
+        expect(sent.eventId).toBeDefined();
+        expect(typeof sent.eventId).toBe('string');
+    });
+
+    it('does not re-deliver an event after it has been acknowledged', async () => {
+        vi.useFakeTimers();
+        const ws = makeMockWs();
+        const events = [makeMockEvent(CONTRACT_A, 'transfer', 101)];
+        const client = makeMockClient(events, 101);
+        const relay = new SorobanEventRelay(ws, client);
+
+        relay.subscribe({ contractId: CONTRACT_A });
+        // Flush the mock promise chain from the async poll (getLatestLedger + getEvents)
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+
+        expect(ws.send).toHaveBeenCalledOnce();
+        const sent = JSON.parse(ws.send.mock.calls[0][0]) as SorobanEvent;
+
+        relay.acknowledgeEvent(sent.eventId);
+        vi.advanceTimersByTime(ACK_TIMEOUT_MS + 1);
+
+        expect(ws.send).toHaveBeenCalledOnce();
+    });
+
+    it('re-delivers an event after the ACK timeout expires', async () => {
+        vi.useFakeTimers();
+        const ws = makeMockWs();
+        const events = [makeMockEvent(CONTRACT_A, 'transfer', 101)];
+        const client = makeMockClient(events, 101);
+        const relay = new SorobanEventRelay(ws, client);
+
+        relay.subscribe({ contractId: CONTRACT_A });
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+
+        expect(ws.send).toHaveBeenCalledOnce();
+
+        vi.advanceTimersByTime(ACK_TIMEOUT_MS + 1);
+
+        expect(ws.send).toHaveBeenCalledTimes(2);
+    });
+
+    it(`moves an event to the dead-letter buffer after ${MAX_DELIVERY_ATTEMPTS} unACKed attempts`, async () => {
+        vi.useFakeTimers();
+        const ws = makeMockWs();
+        const events = [makeMockEvent(CONTRACT_A, 'transfer', 101)];
+        const client = makeMockClient(events, 101);
+        const relay = new SorobanEventRelay(ws, client);
+
+        relay.subscribe({ contractId: CONTRACT_A });
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+
+        expect(ws.send).toHaveBeenCalledOnce();
+
+        // Advance past the ACK timeout MAX_DELIVERY_ATTEMPTS times;
+        // the 5th timeout fires, sees attempts === MAX, and routes to DLB
+        for (let i = 0; i < MAX_DELIVERY_ATTEMPTS; i++) {
+            vi.advanceTimersByTime(ACK_TIMEOUT_MS + 1);
+        }
+
+        expect(ws.send).toHaveBeenCalledTimes(MAX_DELIVERY_ATTEMPTS);
+        expect(relay.deadLetterBuffer).toHaveLength(1);
+        expect(relay.deadLetterBuffer[0].contractId).toBe(CONTRACT_A);
+    });
+
+    it('re-delivered events carry the same eventId as the original delivery', async () => {
+        vi.useFakeTimers();
+        const ws = makeMockWs();
+        const events = [makeMockEvent(CONTRACT_A, 'transfer', 101)];
+        const client = makeMockClient(events, 101);
+        const relay = new SorobanEventRelay(ws, client);
+
+        relay.subscribe({ contractId: CONTRACT_A });
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+
+        const firstSent = JSON.parse(ws.send.mock.calls[0][0]) as SorobanEvent;
+
+        vi.advanceTimersByTime(ACK_TIMEOUT_MS + 1);
+
+        const secondSent = JSON.parse(ws.send.mock.calls[1][0]) as SorobanEvent;
+        expect(secondSent.eventId).toBe(firstSent.eventId);
     });
 });
 
