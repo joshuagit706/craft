@@ -31,6 +31,8 @@ import {
   validatePassphraseMismatch,
   validateConfigurationConsistency,
 } from './__fixtures__/stellar-networks';
+import { validateNetworkPassphrase } from './config';
+import { NetworkMismatchError } from './errors';
 import type { StellarNetworkConfig } from '@craft/types';
 
 describe('Stellar Cross-Network Configuration Tests', () => {
@@ -325,6 +327,62 @@ describe('Stellar Cross-Network Configuration Tests', () => {
       const result = validateConfigurationConsistency(invalidConfig);
       expect(result.isValid).toBe(false);
       expect(result.errors.length).toBeGreaterThan(0);
+    });
+  });
+
+  describe('Network Passphrase Contamination Prevention (#779)', () => {
+    it('rejects a mainnet-signed transaction on testnet configuration', () => {
+      expect(() => validateNetworkPassphrase(Networks.PUBLIC, 'testnet')).toThrow(
+        NetworkMismatchError
+      );
+    });
+
+    it('rejects a testnet-signed transaction on mainnet configuration', () => {
+      expect(() => validateNetworkPassphrase(Networks.TESTNET, 'mainnet')).toThrow(
+        NetworkMismatchError
+      );
+    });
+
+    it('NetworkMismatchError includes the transaction passphrase in the message', () => {
+      let caught: NetworkMismatchError | undefined;
+      try {
+        validateNetworkPassphrase(Networks.PUBLIC, 'testnet');
+      } catch (e) {
+        caught = e as NetworkMismatchError;
+      }
+      expect(caught).toBeInstanceOf(NetworkMismatchError);
+      expect(caught!.message).toContain(Networks.PUBLIC);
+    });
+
+    it('NetworkMismatchError includes the expected passphrase in the message', () => {
+      let caught: NetworkMismatchError | undefined;
+      try {
+        validateNetworkPassphrase(Networks.PUBLIC, 'testnet');
+      } catch (e) {
+        caught = e as NetworkMismatchError;
+      }
+      expect(caught).toBeInstanceOf(NetworkMismatchError);
+      expect(caught!.message).toContain(Networks.TESTNET);
+    });
+
+    it('accepts a testnet passphrase on testnet configuration', () => {
+      expect(() => validateNetworkPassphrase(Networks.TESTNET, 'testnet')).not.toThrow();
+    });
+
+    it('accepts a mainnet passphrase on mainnet configuration', () => {
+      expect(() => validateNetworkPassphrase(Networks.PUBLIC, 'mainnet')).not.toThrow();
+    });
+
+    it('exposes both passphrases on the NetworkMismatchError instance', () => {
+      try {
+        validateNetworkPassphrase(Networks.TESTNET, 'mainnet');
+        expect.fail('should have thrown');
+      } catch (e) {
+        expect(e).toBeInstanceOf(NetworkMismatchError);
+        const err = e as NetworkMismatchError;
+        expect(err.txPassphrase).toBe(Networks.TESTNET);
+        expect(err.expectedPassphrase).toBe(Networks.PUBLIC);
+      }
     });
   });
 

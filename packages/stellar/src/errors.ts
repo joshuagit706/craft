@@ -918,6 +918,29 @@ export function formatError(error: unknown, verbose = false): string {
 }
 
 /**
+ * Thrown when a transaction's network passphrase does not match the target network.
+ * Prevents cross-network transaction replay (e.g. testnet tx submitted to mainnet).
+ */
+export class NetworkMismatchError extends Error {
+  readonly txPassphrase: string;
+  readonly expectedPassphrase: string;
+
+  constructor(txPassphrase: string, expectedPassphrase: string, targetNetwork?: string) {
+    const targetPart = targetNetwork
+      ? ` target network "${targetNetwork}" requires`
+      : ' expected';
+    super(
+      `Network passphrase mismatch: transaction signed for "${txPassphrase}" ` +
+      `but${targetPart} "${expectedPassphrase}". ` +
+      `This prevents cross-network transaction replay.`
+    );
+    this.name = 'NetworkMismatchError';
+    this.txPassphrase = txPassphrase;
+    this.expectedPassphrase = expectedPassphrase;
+  }
+}
+
+/**
  * Map a Soroban contract error code to a typed application error.
  * Provides a fallback for unknown error codes.
  *

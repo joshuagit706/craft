@@ -13,6 +13,7 @@
  */
 
 import { describe, it, expect, vi, afterEach } from 'vitest';
+import { Networks } from 'stellar-sdk';
 import { server, loadAccount, getAccountBalance, submitTransaction } from './service';
 import {
     makeAccountResponse,
@@ -137,7 +138,7 @@ describe('submitTransaction – mock-based', () => {
     it('wraps submission failure with descriptive error', async () => {
         vi.spyOn(server, 'submitTransaction').mockRejectedValue(new Error('txFAILED'));
 
-        const tx = { hash: () => TX_HASH } as any;
+        const tx = { hash: () => TX_HASH, networkPassphrase: Networks.TESTNET } as any;
         await expect(submitTransaction(tx)).rejects.toThrow('Failed to submit transaction');
     });
 
@@ -146,7 +147,7 @@ describe('submitTransaction – mock-based', () => {
             Object.assign(new Error('op_no_source_account'), { extras: { result_codes: { transaction: 'tx_failed' } } })
         );
 
-        const tx = { hash: () => TX_HASH } as any;
+        const tx = { hash: () => TX_HASH, networkPassphrase: Networks.TESTNET } as any;
         await expect(submitTransaction(tx)).rejects.toThrow('Failed to submit transaction');
     });
 });

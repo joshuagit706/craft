@@ -1,6 +1,6 @@
 import { SorobanRpc, Contract, Transaction, TransactionBuilder, Networks, BASE_FEE, xdr, hash, StrKey } from 'stellar-sdk';
 import { config } from './config';
-import { parseStellarError } from './errors';
+import { parseStellarError, NetworkMismatchError } from './errors';
 
 // Minimal AppError shape — matches apps/backend/src/lib/api/retryable-error.ts
 export interface AppError {
@@ -278,11 +278,19 @@ export async function prepareContractCall(
  * Sends a signed transaction to the Soroban RPC and polls for the result.
  *
  * @param signedTxXdr - The signed transaction in XDR format
+ * @param txPassphrase - Optional: the network passphrase the transaction was signed for.
+ *   When provided, it is validated against the configured network to prevent
+ *   cross-network transaction submission.
  */
 export async function sendSorobanTransaction(
-    signedTxXdr: string
+    signedTxXdr: string,
+    txPassphrase?: string
 ): Promise<SorobanRpc.Api.GetTransactionResponse> {
-    const tx = TransactionBuilder.fromXDR(signedTxXdr, getNetworkPassphrase());
+    const expectedPassphrase = getNetworkPassphrase();
+    if (txPassphrase !== undefined && txPassphrase !== expectedPassphrase) {
+        throw new NetworkMismatchError(txPassphrase, expectedPassphrase);
+    }
+    const tx = TransactionBuilder.fromXDR(signedTxXdr, expectedPassphrase);
     const sendResult = await sorobanClient.sendTransaction(tx);
 
     if (sendResult.status === 'ERROR') {
@@ -479,3 +487,16 @@ export async function buildFeeBumpTransaction(
         return { ok: false, error: parsed.message };
     }
 }
+
+// ---------------------------------------------------------------------------
+// Soroban Storage Key Namespace Isolation (#778)
+// ---------------------------------------------------------------------------
+
+export {
+    namespaceKey,
+    stripNamespace,
+    detectStorageKeyCollisions,
+    assertNoStorageKeyCollisions,
+    StorageKeyCollisionError,
+} from './storage-namespace';
+export type { StorageKeyEntry, StorageKeyCollision, StorageDurability } from './storage-namespace';

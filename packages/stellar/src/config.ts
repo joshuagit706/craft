@@ -1,5 +1,6 @@
 import { Networks } from 'stellar-sdk';
 import type { StellarNetworkConfig } from '@craft/types';
+import { NetworkMismatchError } from './errors';
 
 export const NETWORK_PASSPHRASES = {
   mainnet: Networks.PUBLIC,
@@ -54,11 +55,7 @@ export function validateNetworkPassphrase(
   const expectedPassphrase = NETWORK_PASSPHRASES[net];
 
   if (transactionPassphrase !== expectedPassphrase) {
-    throw new Error(
-      `Network passphrase mismatch: transaction signed for "${transactionPassphrase}" ` +
-      `but target network "${net}" requires "${expectedPassphrase}". ` +
-      `This prevents cross-network transaction replay.`
-    );
+    throw new NetworkMismatchError(transactionPassphrase, expectedPassphrase, net);
   }
 }
 

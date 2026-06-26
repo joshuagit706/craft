@@ -125,10 +125,9 @@ export async function batchValidateAccounts(
 }
 
 export async function submitTransaction(transaction: Transaction, network?: Network) {
+  // Throws NetworkMismatchError if the transaction's passphrase doesn't match the target network
+  validateNetworkPassphrase(transaction.networkPassphrase, network);
   try {
-    // Validate network passphrase before submission
-    validateNetworkPassphrase(transaction.networkPassphrase, network);
-    
     return await getHorizonClient(network).submitTransaction(transaction);
   } catch (error) {
     const parsed = parseStellarError(error, (transaction as any).hash);
@@ -235,6 +234,8 @@ export async function submitWithSequenceRetry(
   while (true) {
     const seq = await _manager.getSequence(accountId, horizon);
     const tx = buildTransaction(seq);
+    // Throws NetworkMismatchError before any network call if the passphrase is wrong
+    validateNetworkPassphrase(tx.networkPassphrase, network);
     try {
       const result = await horizon.submitTransaction(tx);
       _manager.increment(accountId);

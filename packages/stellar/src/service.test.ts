@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
+import { Networks } from 'stellar-sdk';
 import { server, loadAccount, getAccountBalance, submitTransaction } from './service';
 
 describe('Stellar wrapper service', () => {
@@ -34,14 +35,14 @@ describe('Stellar wrapper service', () => {
     const response = { id: 'tx_123', successful: true } as any;
     vi.spyOn(server, 'submitTransaction').mockResolvedValue(response);
 
-    const tx = { hash: () => 'abc123' } as any;
+    const tx = { hash: () => 'abc123', networkPassphrase: Networks.TESTNET } as any;
     await expect(submitTransaction(tx)).resolves.toEqual(response);
   });
 
   it('wraps submit transaction failures with descriptive wrapper error', async () => {
     vi.spyOn(server, 'submitTransaction').mockRejectedValue(new Error('txFAILED'));
 
-    const tx = { hash: () => 'deadbeef' } as any;
+    const tx = { hash: () => 'deadbeef', networkPassphrase: Networks.TESTNET } as any;
     await expect(submitTransaction(tx)).rejects.toThrow('Failed to submit transaction');
   });
 });
